@@ -110,7 +110,7 @@ export function validateVaultPath(input: string): string {
 			/[ .]$/.test(part) ||
 			/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(part.normalize('NFKC').split('.')[0].trimEnd()),
 		) ||
-		['.obsidian', '.trash', '.quark-sync-conflicts', '.quark-note-sync'].includes(parts[0].normalize('NFKC').toLowerCase())
+		['.trash', '.quark-sync-conflicts', '.quark-note-sync'].includes(parts[0].normalize('NFKC').toLowerCase())
 	) {
 		throw new Error('同步路径不能指向上级目录、配置或本地冲突文件夹');
 	}
@@ -118,7 +118,7 @@ export function validateVaultPath(input: string): string {
 }
 
 /** Reject names that alias on Windows or that would make a file overwrite a directory. */
-export function validatePathSet(paths: string[], configDir = '.obsidian'): string[] {
+export function validatePathSet(paths: string[], configDir: string): string[] {
 	const normalized = new Map<string, string>();
 	const normalizedDirectories = new Map<string, string>();
 	const valid = paths.map(validateVaultPath);
@@ -153,7 +153,7 @@ export function validatePathSet(paths: string[], configDir = '.obsidian'): strin
 }
 
 /** Markdown, Canvas, and ordinary attachments are eligible; local state and oversized files are not. */
-export function isSyncablePath(path: string, size: number, configDir = '.obsidian'): boolean {
+export function isSyncablePath(path: string, size: number, configDir: string): boolean {
 	if (!Number.isSafeInteger(size) || size < 0 || size > MAX_FILE_BYTES) return false;
 	try {
 		const validPath = validateVaultPath(path);

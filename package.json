@@ -18,6 +18,8 @@
     "typescript": "6.0.3"
   },
   "dependencies": {
+    "@codemirror/state": "6.7.6",
+    "@codemirror/view": "6.43.13",
     "hls.js": "1.7.4",
     "qrcode": "1.5.4"
   },

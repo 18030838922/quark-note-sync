@@ -17,6 +17,7 @@ test('a second device receives the original Quark reference without an offline c
 		size: offlineBytes.byteLength,
 	};
 	const upload = await buildSyncPlan({
+		configDir: '.obsidian',
 		localFiles: [note, offlineCopy],
 		presentPaths: [note.path, offlineCopy.path],
 		managedPaths: [offlineCopy.path],
@@ -29,6 +30,7 @@ test('a second device receives the original Quark reference without an offline c
 	assert.equal(upload.events[0].sha256, note.sha256);
 
 	const receive = await buildSyncPlan({
+		configDir: '.obsidian',
 		localFiles: [],
 		presentPaths: [],
 		snapshots: {},

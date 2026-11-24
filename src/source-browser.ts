@@ -1,7 +1,7 @@
 import { mountQuarkVideo, type VideoStream } from './video-stream.ts';
 import { ItemView, Notice, type WorkspaceLeaf } from 'obsidian';
 import type { RemoteFile } from './quark-api.ts';
-import { parseOfficialShareUrl, previewKindForFile, type PreviewKind } from './quark-references.ts';
+import { parseOfficialShareUrl, type PreviewKind } from './quark-references.ts';
 
 export const QUARK_PREVIEW_VIEW_TYPE = 'quark-note-sync-preview';
 export const QUARK_BROWSER_VIEW_TYPE = 'quark-note-sync-browser';
@@ -357,7 +357,7 @@ export class QuarkBrowserView extends ItemView {
 				});
 			});
 		}
-		row.createEl('span', { cls: 'quark-browser-size', text: entry.isDirectory ? '' : formatBytes(entry.size) });
+		row.createSpan({ cls: 'quark-browser-size', text: entry.isDirectory ? '' : formatBytes(entry.size) });
 	}
 
 	private openShareFile(file: ShareEntryLike): void {

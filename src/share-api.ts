@@ -1,3 +1,4 @@
+import { hasAsciiControl } from './core.ts';
 import { selectQuarkVideoStream } from './video-stream-url.ts';
 import type { HttpRequester } from './quark-api.ts';
 import type { HttpRequest, HttpResponse } from './transport.ts';
@@ -261,14 +262,14 @@ export class QuarkShareClient {
 function safeInput(value: string, reason: ShareApiErrorReason): string {
 	if (typeof value !== 'string') throw new ShareApiError(reason);
 	const trimmed = value.trim();
-	if (!trimmed || trimmed.length > 512 || /[\u0000-\u001f\u007f]/.test(trimmed)) throw new ShareApiError(reason);
+	if (!trimmed || trimmed.length > 512 || hasAsciiControl(trimmed)) throw new ShareApiError(reason);
 	return trimmed;
 }
 
 function safePasscode(value: string): string {
 	if (typeof value !== 'string') throw new ShareApiError('passcode');
 	const trimmed = value.trim();
-	if (trimmed.length > 512 || /[\u0000-\u001f\u007f]/.test(trimmed)) throw new ShareApiError('passcode');
+	if (trimmed.length > 512 || hasAsciiControl(trimmed)) throw new ShareApiError('passcode');
 	return trimmed;
 }
 

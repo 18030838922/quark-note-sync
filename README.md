@@ -54,6 +54,8 @@ If a session expires, scan a fresh QR code or import a fresh authorization code 
 
 ## Data and conflict handling
 
+- The plugin lists the vault’s registered files to plan sync and calculate storage usage. It filters out the active Obsidian configuration folder, local conflict copies, and tracked Quark downloads when planning sync.
+- To copy a mobile authorization code, choose **Select authorization code**, then use your system’s copy command. The plugin does not access the clipboard.
 - The plugin stores the Quark session in Obsidian SecretStorage. It sends the session only to allowed Quark HTTPS endpoints. The session and pairing password are excluded from plugin settings, sync data, and logs.
 - The mobile authorization code is encrypted on the device using PBKDF2-SHA256 and AES-256-GCM. It contains the session and target folder information. Share the code and its password through separate channels.
 - Concurrent versions can produce files under `.quark-sync-conflicts/`. Concurrent edits and deletes preserve the edited content. Synced local deletions use Obsidian's configured file deletion preference.

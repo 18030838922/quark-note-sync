@@ -9,18 +9,16 @@ export interface VideoStream {
 }
 
 export function mountQuarkVideo(container: HTMLElement, stream: VideoStream): () => void {
-	const video = container.ownerDocument.createElement('video');
+	const video = container.ownerDocument.createDocumentFragment().createEl('video');
 	video.controls = true;
 	video.playsInline = true;
 	video.preload = 'none';
 	video.className = 'quark-inline-media-video';
-	const status = container.ownerDocument.createElement('span');
-	status.setAttribute('role', 'status');
-	const button = container.ownerDocument.createElement('button');
+	const button = container.createEl('button');
 	button.type = 'button';
 	button.textContent = stream.language === 'en' ? 'Play from Quark' : '在线播放';
-	container.append(button, status);
-	const fallback = container.ownerDocument.createElement('a');
+	const status = container.createSpan({ attr: { role: 'status' } });
+	const fallback = container.ownerDocument.createDocumentFragment().createEl('a');
 	fallback.textContent = stream.language === 'en' ? 'Open Quark' : '打开夸克';
 	fallback.target = '_blank';
 	fallback.rel = 'noopener noreferrer';

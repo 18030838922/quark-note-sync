@@ -15,6 +15,7 @@ import {
 	type MarkdownFileInfo,
 	type TAbstractFile,
 	type TextComponent,
+	type SettingDefinitionItem,
 	type WorkspaceLeaf,
 } from 'obsidian';
 import QRCode from 'qrcode';
@@ -28,7 +29,7 @@ import { createPairingCode, readPairingCode } from './pairing-code.ts';
 import { settingsText, type Language } from './settings-text.ts';
 import { DASHBOARD_VIEW_TYPE, QuarkDashboardSidebar, type QuarkDashboardActions, type QuarkDashboardView } from './dashboard.ts';
 import { summarizeVaultFiles } from './dashboard-stats.ts';
-import { addSourceIndexEntry, chooseDownloadPath, managedDownloadPaths, moveSourceIndexPath, normalizeSourceIndex, QUARK_DOWNLOADS_DIRECTORY, sourceIndexKey, type SourceIndex, type SourceIndexEntry } from './source-index.ts';
+import { addSourceIndexEntry, chooseDownloadPath, managedDownloadPaths, moveSourceIndexPath, normalizeSourceIndex, QUARK_DOWNLOADS_DIRECTORY, type SourceIndex, type SourceIndexEntry } from './source-index.ts';
 import { accountReferenceKey, findOfficialShareUrl, formatPersonalReference, formatPublicShareReference, MAX_PERSONAL_DOWNLOAD_BYTES, isInlineMediaName, loadWhenVisible, mapInsertionRange, mimeTypeForFile, parseOfficialShareUrl, parsePersonalReference, previewKindForFile, type PersonalReference, type PreviewKind } from './quark-references.ts';
 import {
 	QUARK_BROWSER_VIEW_TYPE,
@@ -195,7 +196,7 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 				const reference = parsePersonalReference(image.getAttribute('src') ?? image.src);
 				if (!reference || image.dataset.quarkShareHandler === '1') continue;
 				image.dataset.quarkShareHandler = '1';
-				const button = element.ownerDocument.createElement('button');
+				const button = image.ownerDocument.createDocumentFragment().createEl('button');
 				button.type = 'button';
 				button.className = 'quark-inline-load-button';
 				button.textContent = this.config.language === 'en' ? `Load ${image.alt || 'Quark image'}` : `加载${image.alt || '夸克图片'}`;
@@ -534,7 +535,7 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 	private async saveQuarkDownload(name: string, bytes: Uint8Array, source: { accountKey: string; fid: string }): Promise<string> {
 		await this.ensureQuarkDownloadsFolder();
 		const paths = new Set<string>([
-			...this.app.vault.getFiles().map((file) => file.path),
+			...(this.app.vault.getFolderByPath(QUARK_DOWNLOADS_DIRECTORY)?.children ?? []).map((file) => file.path),
 			...Object.keys(this.config.snapshots),
 			...Object.keys(this.config.pendingApplies),
 			...managedDownloadPaths(this.config.sourceIndex),
@@ -1552,9 +1553,15 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 	}
 }
 
+interface QuarkSettingRow {
+	name: string;
+	desc?: string;
+	render: (setting: Setting) => void | (() => void);
+}
+
 class QuarkSettingsTab extends PluginSettingTab {
 	private readonly plugin: QuarkNoteSyncPlugin;
-	private accountSection: HTMLElement | undefined;
+	private accountRow: Setting | undefined;
 
 	constructor(app: App, plugin: QuarkNoteSyncPlugin) {
 		super(app, plugin);
@@ -1562,169 +1569,236 @@ class QuarkSettingsTab extends PluginSettingTab {
 	}
 
 	display(): void {
+		this.renderLegacySettings();
+	}
+
+	getSettingDefinitions(): SettingDefinitionItem[] {
+		const { language } = this.plugin.settingsView;
+		const copy = settingsText[language];
+		return [...this.getSettingsRows(), { type: 'page', name: copy.advanced, items: [this.getCookieSetting()] }];
+	}
+
+	private renderLegacySettings(): void {
 		const { containerEl } = this;
 		containerEl.empty();
-		const language = this.plugin.settingsView.language;
-		const copy = settingsText[language];
-		new Setting(containerEl).setName(copy.title).setHeading();
-		new Setting(containerEl).addButton((button) => button
-			.setButtonText(language === 'en' ? 'Open sync dashboard' : '打开同步面板')
-			.onClick(() => void this.plugin.openDashboard()));
-		new Setting(containerEl)
-			.setName('语言 / Language')
-			.addDropdown((dropdown) => dropdown
-				.addOption('zh-CN', '简体中文')
-				.addOption('en', 'English')
-				.setValue(language)
-				.onChange(async (value) => {
-					dropdown.setDisabled(true);
-					const changed = await this.plugin.setLanguage(value);
-					if (changed && this.accountSection) this.display();
-					else dropdown.setValue(this.plugin.settingsView.language).setDisabled(false);
-				}));
-		const last = this.plugin.settingsView.lastSummary;
-		containerEl.createEl('p', {
-			text: last
-				? language === 'en'
-					? `Last sync: ${last.uploaded} uploaded, ${last.downloaded} downloaded, ${last.deleted} deleted, ${last.conflicts} conflicts, ${last.skipped.length} skipped`
-					: `上次同步：上传 ${last.uploaded}，下载 ${last.downloaded}，删除 ${last.deleted}，冲突 ${last.conflicts}，跳过 ${last.skipped.length}`
-				: copy.noSummary,
-		});
-
-		this.accountSection = containerEl.createDiv();
-		this.refreshAccount();
-
-		let cookieInput!: TextComponent;
+		for (const item of this.getSettingsRows()) this.renderLegacyRow(containerEl, item);
 		const advanced = containerEl.createEl('details');
-		advanced.createEl('summary', { text: copy.advanced });
-		new Setting(advanced)
-			.setName(copy.cookie)
-			.setDesc(copy.cookieHelp)
-			.addText((text) => {
-				cookieInput = text;
-				text.inputEl.type = 'password';
-				text.inputEl.autocomplete = 'off';
-				text.inputEl.setAttribute('autocapitalize', 'off');
-				text.inputEl.setAttribute('spellcheck', 'false');
-				text.setPlaceholder(this.plugin.savedCookieExists ? copy.cookieSaved : copy.cookieEmpty);
-				text.setDisabled(this.plugin.isBusy);
-			})
-			.addButton((button) => button
-				.setButtonText(copy.saveCookie)
-				.setDisabled(this.plugin.isBusy)
-				.onClick(async () => {
-					await this.plugin.saveCookie(cookieInput.getValue());
-					cookieInput.setValue('');
-					cookieInput.setPlaceholder(this.plugin.savedCookieExists ? copy.cookieSaved : copy.cookieEmpty);
-				}));
+		advanced.createEl('summary', { text: settingsText[this.plugin.settingsView.language].advanced });
+		this.renderLegacyRow(advanced, this.getCookieSetting());
+	}
 
-		let cloudInput!: TextComponent;
-		new Setting(containerEl)
-			.setName(copy.cloudFolder)
-			.setDesc(copy.cloudFolderHelp)
-			.addText((text) => {
-				cloudInput = text;
-				text.setValue(this.plugin.settingsView.cloudDirectoryName);
-				text.setPlaceholder(DEFAULT_CLOUD_DIRECTORY);
-				text.setDisabled(this.plugin.isBusy);
-			})
-			.addButton((button) => button
-				.setButtonText(copy.save)
-				.setDisabled(this.plugin.isBusy)
-				.onClick(() => void this.plugin.saveCloudDirectoryName(cloudInput.getValue())));
+	private renderLegacyRow(container: HTMLElement, item: QuarkSettingRow): void {
+		const row = new Setting(container).setName(item.name);
+		if (item.desc) row.setDesc(item.desc);
+		item.render(row);
+	}
 
-		let deviceInput!: TextComponent;
-		new Setting(containerEl)
-			.setName(copy.deviceName)
-			.setDesc(copy.deviceHelp)
-			.addText((text) => {
-				deviceInput = text;
-				text.setValue(this.plugin.settingsView.deviceName);
-				text.setPlaceholder(copy.deviceExample);
-				text.setDisabled(this.plugin.isBusy);
-			})
-			.addButton((button) => button
-				.setButtonText(copy.save)
-				.setDisabled(this.plugin.isBusy)
-				.onClick(() => void this.plugin.saveDeviceName(deviceInput.getValue())));
+	private getSettingsRows(): QuarkSettingRow[] {
+		const { language, lastSummary: last } = this.plugin.settingsView;
+		const copy = settingsText[language];
+		return [
+			{
+				name: copy.title,
+				render: (row) => {
+					row.setHeading();
+				},
+			},
+			{
+				name: language === 'en' ? 'Open sync dashboard' : '打开同步面板',
+				render: (row) => {
+					row.addButton((button) => button
+						.setButtonText(language === 'en' ? 'Open' : '打开')
+						.onClick(() => void this.plugin.openDashboard()));
+				},
+			},
+			{
+				name: '语言 / Language',
+				render: (row) => {
+					row.addDropdown((dropdown) => dropdown
+						.addOption('zh-CN', '简体中文')
+						.addOption('en', 'English')
+						.setValue(language)
+						.onChange(async (value) => {
+							dropdown.setDisabled(true);
+							const changed = await this.plugin.setLanguage(value);
+							if (changed && this.accountRow) {
+								if (typeof this.update === 'function') this.update();
+								else this.renderLegacySettings();
+							}
+							else dropdown.setValue(this.plugin.settingsView.language).setDisabled(false);
+						}));
+				},
+			},
+			{
+				name: copy.account,
+				render: (row) => {
+					this.accountRow = row;
+					this.renderAccount(row);
+					return () => {
+						if (this.accountRow === row) this.accountRow = undefined;
+					};
+				},
+			},
+			{
+				name: copy.cloudFolder,
+				desc: copy.cloudFolderHelp,
+				render: (row) => {
+					let cloudInput!: TextComponent;
+					row.addText((text) => {
+						cloudInput = text;
+						text.setValue(this.plugin.settingsView.cloudDirectoryName);
+						text.setPlaceholder(DEFAULT_CLOUD_DIRECTORY);
+						text.setDisabled(this.plugin.isBusy);
+						})
+						.addButton((button) => button
+						.setButtonText(copy.save)
+						.setDisabled(this.plugin.isBusy)
+						.onClick(() => void this.plugin.saveCloudDirectoryName(cloudInput.getValue())));
+				},
+			},
+			{
+				name: copy.deviceName,
+				desc: copy.deviceHelp,
+				render: (row) => {
+					let deviceInput!: TextComponent;
+					row.addText((text) => {
+						deviceInput = text;
+						text.setValue(this.plugin.settingsView.deviceName);
+						text.setPlaceholder(copy.deviceExample);
+						text.setDisabled(this.plugin.isBusy);
+						})
+						.addButton((button) => button
+						.setButtonText(copy.save)
+						.setDisabled(this.plugin.isBusy)
+						.onClick(() => void this.plugin.saveDeviceName(deviceInput.getValue())));
+				},
+			},
+			{
+				name: copy.periodic,
+				desc: this.plugin.isFirstSyncComplete ? copy.periodicHelp : copy.firstSyncRequired,
+				render: (row) => {
+					row.addToggle((toggle) => toggle
+						.setValue(this.plugin.settingsView.autoSync)
+						.setDisabled(this.plugin.isBusy || !this.plugin.isFirstSyncComplete)
+						.onChange((value) => void this.plugin.setAutoSync(value)));
+				},
+			},
+			{
+				name: copy.startup,
+				desc: this.plugin.isFirstSyncComplete ? copy.startupHelp : copy.firstSyncRequired,
+				render: (row) => {
+					row.addToggle((toggle) => toggle
+						.setValue(this.plugin.settingsView.syncOnStartup)
+						.setDisabled(this.plugin.isBusy || !this.plugin.isFirstSyncComplete)
+						.onChange(async (enabled) => {
+							await this.plugin.setSyncOnStartup(enabled);
+							toggle.setValue(this.plugin.settingsView.syncOnStartup);
+						}));
+				},
+			},
+			{
+				name: copy.interval,
+				desc: copy.intervalHelp,
+				render: (row) => {
+					let intervalInput!: TextComponent;
+					row.addText((text) => {
+						intervalInput = text;
+						text.inputEl.type = 'number';
+						text.inputEl.min = '1';
+						text.inputEl.max = '1440';
+						text.setValue(String(this.plugin.settingsView.autoSyncIntervalMinutes));
+						text.setDisabled(this.plugin.isBusy);
+						})
+						.addButton((button) => button
+						.setButtonText(copy.save)
+						.setDisabled(this.plugin.isBusy)
+						.onClick(() => void this.plugin.setAutoSyncInterval(Number(intervalInput.getValue()))));
+				},
+			},
+			{
+				name: copy.sync,
+				desc: copy.syncHelp,
+				render: (row) => {
+					row.addButton((button) => button
+						.setButtonText(copy.preview)
+						.setDisabled(this.plugin.isBusy)
+						.onClick(() => void this.plugin.previewSync()))
+						.addButton((button) => button
+						.setButtonText(copy.syncNow)
+						.setCta()
+						.setDisabled(this.plugin.isBusy)
+						.onClick(() => void this.plugin.requestSync()));
+				},
+			},
+			{
+				name: copy.details,
+				desc: last
+					? language === 'en'
+						? `Last sync: ${last.uploaded} uploaded, ${last.downloaded} downloaded, ${last.deleted} deleted, ${last.conflicts} conflicts, ${last.skipped.length} skipped`
+						: `上次同步：上传 ${last.uploaded}，下载 ${last.downloaded}，删除 ${last.deleted}，冲突 ${last.conflicts}，跳过 ${last.skipped.length}`
+					: copy.noSummary,
+				render: (row) => {
+					row.addButton((button) => button
+						.setButtonText(copy.viewDetails)
+						.setDisabled(this.plugin.isBusy || !last)
+						.onClick(() => this.plugin.showLastSummary()));
+				},
+			},
+			{
+				name: copy.connection,
+				desc: copy.connectionHelp,
+				render: (row) => {
+					row.addButton((button) => button
+						.setButtonText(copy.checkConnection)
+						.setDisabled(this.plugin.isBusy)
+						.onClick(() => void this.plugin.checkConnection()));
+				},
+			},
+		];
+	}
 
-		new Setting(containerEl)
-			.setName(copy.periodic)
-			.setDesc(this.plugin.isFirstSyncComplete ? copy.periodicHelp : copy.firstSyncRequired)
-			.addToggle((toggle) => toggle
-				.setValue(this.plugin.settingsView.autoSync)
-				.setDisabled(this.plugin.isBusy || !this.plugin.isFirstSyncComplete)
-				.onChange((value) => void this.plugin.setAutoSync(value)));
-
-		new Setting(containerEl)
-			.setName(copy.startup)
-			.setDesc(this.plugin.isFirstSyncComplete ? copy.startupHelp : copy.firstSyncRequired)
-			.addToggle((toggle) => toggle
-				.setValue(this.plugin.settingsView.syncOnStartup)
-				.setDisabled(this.plugin.isBusy || !this.plugin.isFirstSyncComplete)
-				.onChange(async (enabled) => {
-					await this.plugin.setSyncOnStartup(enabled);
-					toggle.setValue(this.plugin.settingsView.syncOnStartup);
-				}));
-
-		let intervalInput!: TextComponent;
-		new Setting(containerEl)
-			.setName(copy.interval)
-			.setDesc(copy.intervalHelp)
-			.addText((text) => {
-				intervalInput = text;
-				text.inputEl.type = 'number';
-				text.inputEl.min = '1';
-				text.inputEl.max = '1440';
-				text.setValue(String(this.plugin.settingsView.autoSyncIntervalMinutes));
-				text.setDisabled(this.plugin.isBusy);
-			})
-			.addButton((button) => button
-				.setButtonText(copy.save)
-				.setDisabled(this.plugin.isBusy)
-				.onClick(() => void this.plugin.setAutoSyncInterval(Number(intervalInput.getValue()))));
-
-		new Setting(containerEl)
-			.setName(copy.sync)
-			.setDesc(copy.syncHelp)
-			.addButton((button) => button
-				.setButtonText(copy.preview)
-				.setDisabled(this.plugin.isBusy)
-				.onClick(() => void this.plugin.previewSync()))
-			.addButton((button) => button
-				.setButtonText(copy.syncNow)
-				.setCta()
-				.setDisabled(this.plugin.isBusy)
-				.onClick(() => void this.plugin.requestSync()));
-
-		new Setting(containerEl)
-			.setName(copy.details)
-			.setDesc(last ? (language === 'en' ? `Skipped paths: ${last.skipped.length}` : `跳过路径：${last.skipped.length}`) : copy.emptyDetails)
-			.addButton((button) => button
-				.setButtonText(copy.viewDetails)
-				.setDisabled(this.plugin.isBusy || !last)
-				.onClick(() => this.plugin.showLastSummary()));
-
-		new Setting(containerEl)
-			.setName(copy.connection)
-			.setDesc(copy.connectionHelp)
-			.addButton((button) => button
-				.setButtonText(copy.checkConnection)
-				.setDisabled(this.plugin.isBusy)
-				.onClick(() => void this.plugin.checkConnection()));
+	private getCookieSetting(): QuarkSettingRow {
+		const copy = settingsText[this.plugin.settingsView.language];
+		return {
+			name: copy.cookie,
+			desc: copy.cookieHelp,
+			render: (row) => {
+				let cookieInput!: TextComponent;
+				row.addText((text) => {
+						cookieInput = text;
+						text.inputEl.type = 'password';
+						text.inputEl.autocomplete = 'off';
+						text.inputEl.setAttribute('autocapitalize', 'off');
+						text.inputEl.setAttribute('spellcheck', 'false');
+						text.setPlaceholder(this.plugin.savedCookieExists ? copy.cookieSaved : copy.cookieEmpty);
+						text.setDisabled(this.plugin.isBusy);
+					})
+					.addButton((button) => button
+						.setButtonText(copy.saveCookie)
+						.setDisabled(this.plugin.isBusy)
+						.onClick(async () => {
+							await this.plugin.saveCookie(cookieInput.getValue());
+							cookieInput.setValue('');
+							cookieInput.setPlaceholder(this.plugin.savedCookieExists ? copy.cookieSaved : copy.cookieEmpty);
+						}));
+			},
+		};
 	}
 
 	hide(): void {
-		this.accountSection = undefined;
+		this.accountRow = undefined;
 	}
 
 	refreshAccount(): void {
-		const section = this.accountSection;
-		if (!section) return;
-		section.empty();
+		const row = this.accountRow;
+		if (!row) return;
+		row.clear();
+		this.renderAccount(row);
+	}
+
+	private renderAccount(row: Setting): void {
 		const copy = settingsText[this.plugin.settingsView.language];
 		const account = this.plugin.accountView;
-		const row = new Setting(section).setName(copy.account);
 		if (account.state === 'connected') {
 			row.setDesc(copy.signedIn + account.label);
 			if (Platform.isDesktopApp && !Platform.isMobileApp) {
@@ -1921,9 +1995,14 @@ class ExportPairingModal extends Modal {
 		code.hidden = true;
 		const buttons = this.contentEl.createDiv({ cls: 'modal-button-container' });
 		const generate = buttons.createEl('button', { text: '生成授权码', cls: 'mod-cta' });
-		const copy = buttons.createEl('button', { text: '复制授权码' });
-		copy.disabled = true;
-		copy.addEventListener('click', () => void copyText(code.value, status));
+		const english = this.plugin.settingsView.language === 'en';
+		const selectCode = buttons.createEl('button', { text: english ? 'Select authorization code' : '选择授权码' });
+		selectCode.disabled = true;
+		selectCode.addEventListener('click', () => {
+			code.focus();
+			code.select();
+			status.setText(english ? 'Code selected. Use your system copy command and share the password separately.' : '授权码已选中，请用系统复制命令。密码仍需单独传给手机。');
+		});
 		buttons.createEl('button', { text: '关闭' }).addEventListener('click', () => this.close());
 		const generateCode = async () => {
 			if (password.value !== confirmation.value) {
@@ -1942,7 +2021,7 @@ class ExportPairingModal extends Modal {
 				confirmation.value = '';
 				code.value = result;
 				code.hidden = false;
-				copy.disabled = false;
+				selectCode.disabled = false;
 				status.setText('授权码已生成。请在 15 分钟内导入手机；密码不会保存。');
 			} finally {
 				generate.disabled = false;
@@ -2258,17 +2337,6 @@ function safeModalError(error: unknown): string {
 	return message.slice(0, 240);
 }
 
-async function copyText(value: string, status: HTMLElement): Promise<void> {
-	try {
-		const clipboard = status.ownerDocument.defaultView?.navigator.clipboard;
-		if (!clipboard) throw new Error('Clipboard API unavailable');
-		await clipboard.writeText(value);
-		status.setText('授权码已复制；密码仍需单独传给手机。');
-	} catch {
-		status.setText('复制失败，请手动选择并复制授权码。');
-	}
-}
-
 function createDeviceId(): string {
 	const cryptoApi = typeof window === 'undefined' ? crypto : window.crypto ?? crypto;
 	if (typeof cryptoApi.randomUUID === 'function') return cryptoApi.randomUUID().toLowerCase();
@@ -2310,8 +2378,9 @@ class QuarkInlineMediaChild extends MarkdownRenderChild {
 }
 
 function createInlineMedia(payload: PreviewPayload, owner: QuarkInlineMediaChild): HTMLElement | undefined {
+	const fragment = owner.containerEl.ownerDocument.createDocumentFragment();
 	if (payload.stream) {
-		const container = owner.containerEl.ownerDocument.createElement('span');
+		const container = fragment.createEl('span');
 		container.className = 'quark-live-reference';
 		owner.trackCleanup(mountQuarkVideo(container, payload.stream));
 		return container;
@@ -2321,13 +2390,13 @@ function createInlineMedia(payload: PreviewPayload, owner: QuarkInlineMediaChild
 	const url = URL.createObjectURL(new Blob([buffer], { type: payload.mimeType }));
 	owner.trackObjectUrl(url);
 	if (payload.kind === 'image') {
-		const image = owner.containerEl.ownerDocument.createElement('img');
+		const image = fragment.createEl('img');
 		image.className = 'quark-inline-media-image';
 		image.alt = payload.name;
 		image.src = url;
 		return image;
 	}
-	const media = owner.containerEl.ownerDocument.createElement(payload.kind) as HTMLAudioElement | HTMLVideoElement;
+	const media = fragment.createEl(payload.kind === 'audio' ? 'audio' : 'video');
 	media.className = `quark-inline-media-${payload.kind}`;
 	media.controls = true;
 	media.preload = 'none';

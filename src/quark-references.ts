@@ -1,3 +1,4 @@
+import { hasAsciiControl } from './core.ts';
 import { sha256Hex } from './hash.ts';
 
 export const MAX_IMAGE_PREVIEW_BYTES = 20 * 1024 * 1024;
@@ -88,7 +89,7 @@ export function findPersonalReferenceLinks(markdown: string): PersonalReferenceL
 		matches.push({
 			from: start,
 			to: start + whole.length,
-			label: (match[2] ?? '').replace(/\\([\\\[\]])/g, '$1'),
+			label: (match[2] ?? '').replace(/\\([\\[\]])/g, '$1'),
 			embedded: match[1] === '!',
 			reference,
 		});
@@ -108,7 +109,7 @@ export function parseOfficialShareUrl(input: string): OfficialShareReference | n
 		const pwdValues = [...url.searchParams.getAll('pwd'), ...url.searchParams.getAll('passcode')];
 		if (pwdValues.length > 1) return null;
 		const passcode = pwdValues[0] ?? '';
-		if (passcode.length > 64 || /[\r\n\u0000-\u001f]/.test(passcode)) return null;
+		if (passcode.length > 64 || hasAsciiControl(passcode)) return null;
 		const officialUrl = new URL(url.toString());
 		officialUrl.search = '';
 		return {
@@ -143,7 +144,7 @@ export function findOfficialShareLinks(markdown: string): OfficialShareLinkRange
 		matches.push({
 			from: start,
 			to: start + match[0].length,
-			label: (match[2] ?? '').replace(/\\([\\\[\]])/g, '$1'),
+			label: (match[2] ?? '').replace(/\\([\\[\]])/g, '$1'),
 			embedded: match[1] === '!',
 			rawUrl: match[3],
 			reference,
@@ -153,7 +154,7 @@ export function findOfficialShareLinks(markdown: string): OfficialShareLinkRange
 }
 
 function escapeMarkdownLabel(value: string): string {
-	return value.replace(/\\/g, '\\\\').replace(/([\[\]])/g, '\\$1').replace(/[\r\n]+/g, ' ');
+	return value.replace(/\\/g, '\\\\').replace(/([[\]])/g, '\\$1').replace(/[\r\n]+/g, ' ');
 }
 
 export function previewKindForFile(name: string): { kind: PreviewKind; maxBytes: number } {

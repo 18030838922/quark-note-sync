@@ -21,7 +21,7 @@ export interface PlanInput {
 	managedPaths?: readonly string[];
 	deviceId: string;
 	now: number;
-	configDir?: string;
+	configDir: string;
 }
 
 export interface PlannedPath {
@@ -41,7 +41,7 @@ export interface SyncPlan {
 }
 
 export async function buildSyncPlan(input: PlanInput): Promise<SyncPlan> {
-	const configDir = input.configDir ?? '.obsidian';
+	const { configDir } = input;
 	const managedPathKeys = new Set((input.managedPaths ?? []).map(pathKey));
 	const skipped: Array<{ path: string; reason: string }> = [];
 	const skippedPaths = new Set<string>();

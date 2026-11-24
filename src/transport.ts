@@ -1,5 +1,3 @@
-import type { IncomingMessage } from 'node:http';
-import type * as NodeHttps from 'node:https';
 
 const COOKIE_API_HOSTS = new Set(['drive-pc.quark.cn', 'drive.quark.cn', 'pan.quark.cn']);
 
@@ -183,7 +181,7 @@ export class QuarkTransport {
 		headers: Record<string, string>,
 		maxResponseBytes?: number,
 	): Promise<HttpResponse> {
-		const nodeRequire = getNodeRequire();
+		const nodeRequire = this.platform === 'desktop' ? getNodeRequire() : undefined;
 		if (!nodeRequire) throw new QuarkTransportError('桌面 HTTPS 接口不可用');
 		const https = nodeRequire('node:https');
 		const url = new URL(request.url);
@@ -205,7 +203,7 @@ export class QuarkTransport {
 				headers,
 				timeout: 60000,
 				signal: request.signal,
-			}, (incoming: IncomingMessage) => {
+			}, (incoming) => {
 				try {
 					assertDeclaredLengthWithinLimit(normalizeHeaders(incoming.headers), maxResponseBytes);
 				} catch (error) {
@@ -331,7 +329,35 @@ function bytesToBase64(bytes: Uint8Array): string {
 	return btoa(binary);
 }
 
-type HttpsRequire = (name: 'node:https') => typeof NodeHttps;
+interface DesktopHttpsResponse {
+	headers: unknown;
+	statusCode?: number;
+	destroy(): void;
+	on(event: 'data', listener: (chunk: Uint8Array | string) => void): void;
+	on(event: 'error', listener: (error: Error) => void): void;
+	on(event: 'end', listener: () => void): void;
+}
+
+interface DesktopHttpsRequest {
+	destroy(error?: Error): void;
+	on(event: 'timeout', listener: () => void): void;
+	on(event: 'error', listener: (error: Error) => void): void;
+	write(body: Uint8Array): void;
+	end(): void;
+}
+
+type HttpsRequire = (name: 'node:https') => {
+	request(options: {
+		protocol: 'https:';
+		hostname: string;
+		port: number;
+		path: string;
+		method: string;
+		headers: Record<string, string>;
+		timeout: number;
+		signal?: AbortSignal;
+	}, onResponse: (incoming: DesktopHttpsResponse) => void): DesktopHttpsRequest;
+};
 
 function getNodeRequire(): HttpsRequire | undefined {
 	try {

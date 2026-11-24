@@ -394,8 +394,8 @@ export class QuarkDashboardSidebar extends ItemView {
 		const iconEl = item.createSpan({ cls: 'quark-dashboard-status-icon' });
 		setIcon(iconEl, icon);
 		const text = item.createDiv({ cls: 'quark-dashboard-status-copy' });
-		text.createEl('span', { cls: 'quark-dashboard-status-label', text: label });
-		text.createEl('span', { cls: `quark-dashboard-status-value${state ? ` is-${state}` : ''}`, text: value });
+		text.createSpan({ cls: 'quark-dashboard-status-label', text: label });
+		text.createSpan({ cls: `quark-dashboard-status-value${state ? ` is-${state}` : ''}`, text: value });
 	}
 
 	private renderPrimaryActions(text: DashboardCopy): void {
@@ -473,7 +473,7 @@ export class QuarkDashboardSidebar extends ItemView {
 
 	private renderQuotaMetric(parent: HTMLElement, label: string, bytes: number, cls: string): void {
 		const metric = parent.createDiv({ cls: `quark-dashboard-quota-metric ${cls}` });
-		metric.createEl('span', { cls: 'quark-dashboard-metric-label', text: label });
+		metric.createSpan({ cls: 'quark-dashboard-metric-label', text: label });
 		metric.createEl('strong', { cls: 'quark-dashboard-metric-value', text: formatBytes(bytes, this.view.language) });
 	}
 
@@ -482,7 +482,7 @@ export class QuarkDashboardSidebar extends ItemView {
 		const count = this.view.vault.fileCount ?? this.view.vault.byKind.reduce((sum, entry) => sum + safeInteger(entry.files), 0);
 		const summary = card.createDiv({ cls: 'quark-dashboard-vault-summary' });
 		summary.createEl('strong', { cls: 'quark-dashboard-big-number', text: formatBytes(this.view.vault.totalBytes, this.view.language) });
-		summary.createEl('span', { cls: 'quark-dashboard-count', text: `${formatInteger(count, this.view.language)} ${text.files}` });
+		summary.createSpan({ cls: 'quark-dashboard-count', text: `${formatInteger(count, this.view.language)} ${text.files}` });
 		card.createEl('h4', { cls: 'quark-dashboard-subtitle', text: text.byKind });
 		const kinds = Array.from(this.view.vault.byKind)
 			.filter((entry) => safeInteger(entry.files) > 0 || safeNumber(entry.bytes) > 0)
@@ -504,8 +504,8 @@ export class QuarkDashboardSidebar extends ItemView {
 			const row = list.createEl('li', { cls: `quark-dashboard-kind-row ${kindPalette[index % kindPalette.length]}` });
 			const topLine = row.createDiv({ cls: 'quark-dashboard-kind-topline' });
 			const label = entry.label?.trim() || entry.kind.trim() || text.unknownKind;
-			topLine.createEl('span', { cls: 'quark-dashboard-kind-label', text: label });
-			topLine.createEl('span', { cls: 'quark-dashboard-kind-value', text: `${formatBytes(entry.bytes, this.view.language)} · ${formatInteger(entry.files, this.view.language)} ${text.files}` });
+			topLine.createSpan({ cls: 'quark-dashboard-kind-label', text: label });
+			topLine.createSpan({ cls: 'quark-dashboard-kind-value', text: `${formatBytes(entry.bytes, this.view.language)} · ${formatInteger(entry.files, this.view.language)} ${text.files}` });
 			const progress = row.createEl('progress', { cls: 'quark-dashboard-progress quark-dashboard-kind-progress' });
 			progress.max = maxBytes;
 			progress.value = Math.min(safeNumber(entry.bytes), maxBytes);
@@ -564,7 +564,7 @@ export class QuarkDashboardSidebar extends ItemView {
 		for (const [label, value, cls] of entries) {
 			const row = legend.createEl('li', { cls: `quark-dashboard-activity-row ${cls}` });
 			const header = row.createDiv({ cls: 'quark-dashboard-activity-header' });
-			header.createEl('span', { cls: 'quark-dashboard-activity-label', text: label });
+			header.createSpan({ cls: 'quark-dashboard-activity-label', text: label });
 			header.createEl('strong', { cls: 'quark-dashboard-activity-value', text: formatInteger(value, this.view.language) });
 		}
 	}
@@ -597,10 +597,10 @@ export class QuarkDashboardSidebar extends ItemView {
 				fileButton.setAttr('aria-label', `${file.name || file.path} (${text.path}: ${file.path})`);
 				fileButton.addEventListener('click', () => this.runFileAction(file.path));
 			} else {
-				pathCell.createEl('span', { cls: 'quark-dashboard-file-name', text: file.path, attr: { title: file.path } });
+				pathCell.createSpan({ cls: 'quark-dashboard-file-name', text: file.path, attr: { title: file.path } });
 			}
 			const typeCell = row.createEl('td', { cls: 'quark-dashboard-file-type' });
-			typeCell.createEl('span', { cls: `quark-dashboard-file-type-chip ${fileTypeClass(file.path)}`, text: text.fileType(file.path) });
+			typeCell.createSpan({ cls: `quark-dashboard-file-type-chip ${fileTypeClass(file.path)}`, text: text.fileType(file.path) });
 			row.createEl('td', { cls: 'quark-dashboard-file-size', text: formatBytes(file.bytes, this.view.language) });
 		}
 	}
@@ -665,7 +665,7 @@ export class QuarkDashboardSidebar extends ItemView {
 				row.createEl('code', { cls: 'quark-dashboard-plan-path', text: item.path, attr: { title: item.path } });
 				const action = item.result.deleted ? text.planDeleted : item.result.winner ? text.planApply : text.planNoFinal;
 				const conflicts = item.result.conflictCopies.length;
-				row.createEl('span', { cls: 'quark-dashboard-plan-result', text: conflicts ? `${action} · ${text.planConflicts(formatInteger(conflicts, this.view.language))}` : action });
+				row.createSpan({ cls: 'quark-dashboard-plan-result', text: conflicts ? `${action} · ${text.planConflicts(formatInteger(conflicts, this.view.language))}` : action });
 			}
 			if (plan.paths.length > 5) list.createEl('li', { cls: 'quark-dashboard-plan-more', text: text.planMore(formatInteger(plan.paths.length - 5, this.view.language)) });
 		}
@@ -675,7 +675,7 @@ export class QuarkDashboardSidebar extends ItemView {
 			for (const item of plan.skipped.slice(0, 3)) {
 				const row = skipped.createEl('li', { cls: 'quark-dashboard-plan-row' });
 				row.createEl('code', { cls: 'quark-dashboard-plan-path', text: item.path, attr: { title: item.path } });
-				row.createEl('span', { cls: 'quark-dashboard-plan-result', text: item.reason });
+				row.createSpan({ cls: 'quark-dashboard-plan-result', text: item.reason });
 			}
 			if (plan.skipped.length > 3) skipped.createEl('li', { cls: 'quark-dashboard-plan-more', text: text.planMore(formatInteger(plan.skipped.length - 3, this.view.language)) });
 		}
@@ -707,7 +707,7 @@ export class QuarkDashboardSidebar extends ItemView {
 		for (const item of skipped) {
 			const row = list.createEl('li');
 			row.createEl('code', { text: item.path });
-			row.createEl('span', { text: item.reason });
+			row.createSpan({ text: item.reason });
 		}
 	}
 

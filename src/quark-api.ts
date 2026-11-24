@@ -112,7 +112,7 @@ export class QuarkClient {
 			fetch_pdir_name: 1,
 			filter_secret_check_fail: 1,
 		});
-		const candidates = Array.isArray(data) ? data : asRecord(data).list;
+		const candidates: unknown = Array.isArray(data) ? data : asRecord(data).list;
 		if (!Array.isArray(candidates)) throw new Error('夸克文件详情响应不完整');
 		const match = candidates.find((value) => String(asRecord(value).fid ?? '') === fid);
 		if (!match) throw new Error('夸克中未找到此文件，或当前账号无权访问');
@@ -407,7 +407,7 @@ export class QuarkClient {
 
 	private async requestDownload(file: RemoteFile, maxBytes?: number): Promise<HttpResponse> {
 		const data = await this.requestApi(`${DRIVE_API}/file/download`, 'POST', {}, { fids: [file.fid] });
-		const candidates = Array.isArray(data) ? data : asRecord(data).list;
+		const candidates: unknown = Array.isArray(data) ? data : asRecord(data).list;
 		const entries: unknown[] = Array.isArray(candidates) ? candidates : [];
 		const records = entries.map(asRecord);
 		const matched = records.find((entry) => String(entry.fid ?? '') === file.fid);
@@ -618,8 +618,8 @@ function readPositiveNumber(value: unknown): number | undefined {
 
 function delay(milliseconds: number): Promise<void> {
 	return new Promise((resolve) => {
-		if (typeof window === 'undefined') setTimeout(resolve, milliseconds);
-		else window.setTimeout(resolve, milliseconds);
+		const timer = typeof window === 'undefined' ? globalThis : window;
+		timer.setTimeout(resolve, milliseconds);
 	});
 }
 

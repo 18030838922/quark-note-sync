@@ -28,7 +28,7 @@ export function normalizeSourceIndex(input: unknown): SourceIndex {
 		const item = value as Partial<SourceIndexEntry>;
 		if (typeof item.accountKey !== 'string' || !ACCOUNT_KEY.test(item.accountKey) ||
 			typeof item.fid !== 'string' || !SAFE_ID.test(item.fid) || !isSourceIndexKey(key, item.accountKey, item.fid) ||
-			typeof item.name !== 'string' || !item.name.trim() || item.name.length > 255 || /[\r\n\u0000-\u001f]/.test(item.name) ||
+			typeof item.name !== 'string' || !item.name.trim() || item.name.length > 255 || hasAsciiControl(item.name) ||
 			typeof item.size !== 'number' || !Number.isSafeInteger(item.size) || item.size < 0 ||
 				typeof item.localPath !== 'string' || !isQuarkDownloadPath(item.localPath) ||
 			typeof item.sha256 !== 'string' || !/^[a-f\d]{64}$/i.test(item.sha256) ||
@@ -142,7 +142,8 @@ export function chooseDownloadPath(name: string, existingPaths: Set<string>): st
 function sanitizeName(name: string): string {
 	let safe = name
 		.normalize('NFKC')
-		.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')
+		.replace(/[\\/:*?"<>|]/g, '_')
+		.split('').map((char) => hasAsciiControl(char) ? '_' : char).join('')
 		.replace(/[ .]+$/g, '')
 		.trim();
 	if (!safe || safe === '.' || safe === '..') return 'download';
@@ -151,7 +152,7 @@ function sanitizeName(name: string): string {
 }
 
 function isQuarkDownloadPath(path: string): boolean {
-	if (path.includes('\\') || /[\u0000-\u001f]/.test(path)) return false;
+	if (path.includes('\\') || hasAsciiControl(path)) return false;
 	const segments = path.split('/');
 	if (segments.length !== 2 || segments[0].normalize('NFKC').toLowerCase() !== QUARK_DOWNLOADS_DIRECTORY.toLowerCase() ||
 		segments[1] === '' || segments[1] === '.' || segments[1] === '..') return false;
@@ -171,4 +172,4 @@ function isSourceIndexKey(key: string, accountKey: string, fid: string): boolean
 	const primary = sourceIndexKey(accountKey, fid);
 	return key === primary || (key.startsWith(`${primary}#`) && key.length <= 1024);
 }
-import { validateVaultPath } from './core.ts';
+import { hasAsciiControl, validateVaultPath } from './core.ts';

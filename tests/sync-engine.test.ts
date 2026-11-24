@@ -30,6 +30,7 @@ const snapshot = (hash: string | null, heads: string[] = ['base']): Record<strin
 
 test('first merge recognizes identical local and remote content without creating an event', async () => {
 	const plan = await buildSyncPlan({
+		configDir: '.obsidian',
 		localFiles: [local('notes.md', 'hash-base', 10)],
 		presentPaths: ['notes.md'],
 		snapshots: {},
@@ -44,6 +45,7 @@ test('first merge recognizes identical local and remote content without creating
 
 test('an offline local edit and remote edit become concurrent heads with a preserved copy', async () => {
 	const plan = await buildSyncPlan({
+		configDir: '.obsidian',
 		localFiles: [local('notes.md', 'hash-local')],
 		presentPaths: ['notes.md'],
 		snapshots: snapshot('hash-base'),
@@ -60,6 +62,7 @@ test('an offline local edit and remote edit become concurrent heads with a prese
 
 test('a deleted local path does not tombstone an oversized path still present on disk', async () => {
 	const plan = await buildSyncPlan({
+		configDir: '.obsidian',
 		localFiles: [],
 		presentPaths: ['notes.md'],
 		protectedPaths: new Map([['notes.md', '超过 10 MiB，已跳过']]),
@@ -76,6 +79,7 @@ test('a deleted local path does not tombstone an oversized path still present on
 
 test('an unreadable file still present on disk is protected from becoming a tombstone', async () => {
 	const plan = await buildSyncPlan({
+		configDir: '.obsidian',
 		localFiles: [],
 		presentPaths: ['notes.md'],
 		protectedPaths: new Map([['notes.md', '本地读取失败，已跳过']]),
@@ -91,6 +95,7 @@ test('an unreadable file still present on disk is protected from becoming a tomb
 
 test('missing acknowledged remote heads stop a path instead of rolling it back', async () => {
 	const plan = await buildSyncPlan({
+		configDir: '.obsidian',
 		localFiles: [local('notes.md', 'hash-base', 10)],
 		presentPaths: ['notes.md'],
 		snapshots: snapshot('hash-base', ['missing-acknowledged-head']),
@@ -120,6 +125,7 @@ test('a custom Obsidian config directory is never considered an incoming vault p
 
 test('a local delete concurrent with a remote edit restores the edited version', async () => {
 	const plan = await buildSyncPlan({
+		configDir: '.obsidian',
 		localFiles: [],
 		presentPaths: [],
 		snapshots: snapshot('hash-base'),
@@ -136,6 +142,7 @@ test('a local delete concurrent with a remote edit restores the edited version',
 test('path collisions pause the affected plan before any local write', async () => {
 	const collidingEvent: VersionEvent = { ...base, id: 'remote', path: 'Notes.md' };
 	const plan = await buildSyncPlan({
+		configDir: '.obsidian',
 		localFiles: [local('notes.md', 'local-hash')],
 		presentPaths: ['notes.md'],
 		snapshots: {},
@@ -150,6 +157,7 @@ test('path collisions pause the affected plan before any local write', async () 
 
 test('prototype-shaped vault names remain ordinary snapshot keys', async () => {
 	const plan = await buildSyncPlan({
+		configDir: '.obsidian',
 		localFiles: [local('__proto__', 'proto-hash'), local('constructor', 'constructor-hash'), local('toString', 'string-hash')],
 		presentPaths: ['__proto__', 'constructor', 'toString'],
 		snapshots: {},
@@ -170,6 +178,7 @@ test('indexed Quark downloads are excluded while ordinary files in the same fold
 	const downloaded: VersionEvent = { ...base, id: 'download', path: 'Quark Downloads/photo.png', sha256: 'download-hash' };
 	const ordinary: VersionEvent = { ...base, id: 'ordinary', path: 'Quark Downloads/my-attachment.txt', sha256: 'ordinary-hash' };
 	const plan = await buildSyncPlan({
+		configDir: '.obsidian',
 		localFiles: [local(downloaded.path, 'download-hash', 10), local(ordinary.path, 'ordinary-hash', 10)],
 		presentPaths: [downloaded.path, ordinary.path],
 		snapshots: {

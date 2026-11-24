@@ -98,7 +98,7 @@ export class QuarkSyncService {
 				if (!content || content.bytes.byteLength !== event.size || content.sha256 !== event.sha256) {
 					throw new Error(`本地文件在上传前发生变化，未发布相关清单：${event.path}`);
 				}
-				await this.ensureBlob(layout.blobsFid!, event.sha256!, event.size!, content.bytes);
+				await this.ensureBlob(layout.blobsFid!, event.sha256, event.size, content.bytes);
 			}
 			await this.publishBatch(layout, batch);
 			this.acknowledgeLocalEvents(batch);

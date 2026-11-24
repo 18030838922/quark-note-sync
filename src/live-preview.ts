@@ -29,10 +29,9 @@ export function createReferenceLivePreview(options: ReferenceLivePreviewOptions)
 		}
 
 		toDOM(view: EditorView): HTMLElement {
-			const doc = view.dom.ownerDocument;
-			const root = doc.createElement('span');
+			const root = view.dom.ownerDocument.createDocumentFragment().createEl('span');
 			root.className = 'quark-live-reference';
-			const button = doc.createElement('button');
+			const button = root.createEl('button');
 			button.type = 'button';
 			button.className = 'quark-live-reference-button';
 			button.textContent = this.range.label || this.label('夸克文件', 'Quark file');
@@ -56,7 +55,6 @@ export function createReferenceLivePreview(options: ReferenceLivePreviewOptions)
 					this.actions.reportError(error);
 				});
 			});
-			root.append(button);
 			if (!('rawUrl' in this.range) && (this.range.embedded || isInlineMediaName(this.range.label))) {
 				const { reference } = this.range;
 				this.stopObserving = loadWhenVisible(root, () => {
@@ -99,18 +97,16 @@ export function createReferenceLivePreview(options: ReferenceLivePreviewOptions)
 			this.objectUrl = URL.createObjectURL(new Blob([buffer], { type: payload.mimeType }));
 			root.replaceChildren();
 			if (payload.kind === 'image') {
-				const image = root.ownerDocument.createElement('img');
+				const image = root.createEl('img');
 				image.className = 'quark-inline-media-image';
 				image.alt = payload.name;
 				image.src = this.objectUrl;
-				root.append(image);
 			} else {
-				const media = root.ownerDocument.createElement(payload.kind) as HTMLAudioElement | HTMLVideoElement;
+				const media = root.createEl(payload.kind === 'audio' ? 'audio' : 'video');
 				media.className = `quark-inline-media-${payload.kind}`;
 				media.controls = true;
 				media.preload = 'none';
 				media.src = this.objectUrl;
-				root.append(media);
 			}
 			view.requestMeasure();
 		}

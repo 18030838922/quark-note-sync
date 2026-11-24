@@ -107,7 +107,7 @@ test('history rejects duplicate, self, and cross-path parents', () => {
 test('vault paths reject traversal and plugin state paths', () => {
 	assert.equal(validateVaultPath('课程/计划.md'), '课程/计划.md');
 	assert.throws(() => validateVaultPath('../secrets.md'), /路径/);
-	assert.throws(() => validateVaultPath('.obsidian/plugins/x/data.json'), /路径/);
+	assert.throws(() => validatePathSet(['.obsidian/plugins/x/data.json'], '.obsidian'), /路径/);
 	assert.throws(() => validateVaultPath('a\\..\\secrets.md'), /路径/);
 	assert.throws(() => validateVaultPath('.trash/recovered.md'), /路径/);
 	assert.throws(() => validateVaultPath('notes/CON.md'), /路径/);
@@ -117,21 +117,21 @@ test('vault paths reject traversal and plugin state paths', () => {
 });
 
 test('path sets reject Windows case or Unicode collisions and file-directory collisions', () => {
-	assert.throws(() => validatePathSet(['Notes/Index.md', 'notes/index.md']), /冲突/);
-	assert.throws(() => validatePathSet(['Notes/Ａ.md', 'Notes/A.md']), /冲突/);
-	assert.throws(() => validatePathSet(['same.md', 'same.md']), /冲突/);
-	assert.throws(() => validatePathSet(['folder', 'folder/child.md']), /冲突/);
-	assert.throws(() => validatePathSet(['Foo/a.md', 'foo/b.md']), /冲突/);
+	assert.throws(() => validatePathSet(['Notes/Index.md', 'notes/index.md'], '.obsidian'), /冲突/);
+	assert.throws(() => validatePathSet(['Notes/Ａ.md', 'Notes/A.md'], '.obsidian'), /冲突/);
+	assert.throws(() => validatePathSet(['same.md', 'same.md'], '.obsidian'), /冲突/);
+	assert.throws(() => validatePathSet(['folder', 'folder/child.md'], '.obsidian'), /冲突/);
+	assert.throws(() => validatePathSet(['Foo/a.md', 'foo/b.md'], '.obsidian'), /冲突/);
 	assert.throws(() => validatePathSet(['private/data.md'], 'private'), /配置/);
-	assert.deepEqual(validatePathSet(['a.md', '附件/图.png']), ['a.md', '附件/图.png']);
+	assert.deepEqual(validatePathSet(['a.md', '附件/图.png'], '.obsidian'), ['a.md', '附件/图.png']);
 });
 
 test('syncable file checks enforce the size cap and exclude local conflict/config state', () => {
 	assert.equal(MAX_FILE_BYTES, 10 * 1024 * 1024);
-	assert.equal(isSyncablePath('附件/图.png', 1024), true);
-	assert.equal(isSyncablePath('大文件.zip', MAX_FILE_BYTES + 1), false);
-	assert.equal(isSyncablePath('.obsidian/plugins/quark-note-sync/data.json', 100), false);
-	assert.equal(isSyncablePath('.quark-sync-conflicts/计划.md', 100), false);
+	assert.equal(isSyncablePath('附件/图.png', 1024, '.obsidian'), true);
+	assert.equal(isSyncablePath('大文件.zip', MAX_FILE_BYTES + 1, '.obsidian'), false);
+	assert.equal(isSyncablePath('.obsidian/plugins/quark-note-sync/data.json', 100, '.obsidian'), false);
+	assert.equal(isSyncablePath('.quark-sync-conflicts/计划.md', 100, '.obsidian'), false);
 	assert.equal(isSyncablePath('local/state.md', 100, 'local'), false);
 });
 
