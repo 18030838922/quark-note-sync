@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+	QuarkTransport,
 	assertNoRedirect,
 	classifyQuarkUrl,
 	createSafeHeaders,
@@ -56,4 +57,31 @@ test('native JSON objects are serialized for text callers and base64 binaries ar
 	assert.equal(new TextDecoder().decode(normalizeNativeBody({ ok: true, count: 2 }, 'text', 'application/json')), '{"ok":true,"count":2}');
 	assert.deepEqual([...normalizeNativeBody('AP8=', 'arraybuffer', 'application/octet-stream')], [0, 255]);
 	assert.equal(new TextDecoder().decode(normalizeNativeBody('hello', 'text', 'text/plain')), 'hello');
+});
+
+
+test('Android download failures keep native error text intact and send the original URL', async () => {
+	const url = 'https://bucket.pds.quark.cn/object?sign=ab%2B%2F%3D&key=a+b';
+	const originalWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+	Object.defineProperty(globalThis, 'window', {
+		configurable: true,
+		value: { Capacitor: {
+			isNativePlatform: () => true,
+			Plugins: { CapacitorHttp: { async request(options: Record<string, unknown>) {
+				assert.equal(options.url, url);
+				assert.equal(options.disableRedirects, true);
+				return { status: 403, url, data: 'AccessDenied', headers: { 'content-type': 'text/plain' } };
+			} } },
+		} },
+	});
+	try {
+		const response = await new QuarkTransport(true).request({
+			url, method: 'GET', cookie: 'sid=fixture', purpose: 'download', responseKind: 'arraybuffer',
+		});
+		assert.equal(response.status, 403);
+		assert.equal(response.text(), 'AccessDenied');
+	} finally {
+		if (originalWindow) Object.defineProperty(globalThis, 'window', originalWindow);
+		else Reflect.deleteProperty(globalThis, 'window');
+	}
 });

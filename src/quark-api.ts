@@ -21,6 +21,11 @@ export interface RemoteFile {
 	size: number;
 }
 
+export interface StorageQuota {
+	totalBytes: number;
+	usedBytes: number;
+}
+
 export class QuarkAuthenticationError extends Error {
 	readonly status: number;
 
@@ -75,6 +80,20 @@ export class QuarkClient {
 			...(accountId ? { accountId } : {}),
 			...(nickname ? { nickname } : {}),
 		};
+	}
+
+	async getStorageQuota(): Promise<StorageQuota | undefined> {
+		let data: Record<string, unknown>;
+		try {
+			data = asRecord(await this.requestApi(`${DRIVE_API}/member`, 'GET'));
+		} catch (error) {
+			if (error instanceof QuarkAuthenticationError) throw error;
+			return undefined;
+		}
+		const totalBytes = readNonNegativeNumber(data.total_capacity);
+		const usedBytes = readNonNegativeNumber(data.use_capacity);
+		if (totalBytes === undefined || usedBytes === undefined || usedBytes > totalBytes) return undefined;
+		return { totalBytes, usedBytes };
 	}
 
 	async findRootFolder(name: string): Promise<RemoteFile | undefined> {
@@ -289,16 +308,31 @@ export class QuarkClient {
 	}
 
 	async downloadFile(file: RemoteFile): Promise<Uint8Array> {
+		let response = await this.requestDownload(file);
+		let failure = response.status === 403 ? readDownloadFailure(response.data) : undefined;
+		if (response.status === 403 && (!failure || failure.retryable)) {
+			response = await this.requestDownload(file);
+			failure = response.status === 403 ? readDownloadFailure(response.data) : undefined;
+		}
+		if (response.status !== 200) {
+			const reason = failure ? '，' + failure.label : '';
+			throw new Error(`夸克下载失败（HTTP ${response.status}${reason}）：${file.name}`);
+		}
+		if (response.data.byteLength !== file.size) throw new Error(`夸克下载长度不匹配：${file.name}`);
+		return response.data;
+	}
+
+	private async requestDownload(file: RemoteFile): Promise<HttpResponse> {
 		const data = await this.requestApi(`${DRIVE_API}/file/download`, 'POST', {}, { fids: [file.fid] });
 		const candidates = Array.isArray(data) ? data : asRecord(data).list;
 		const entries: unknown[] = Array.isArray(candidates) ? candidates : [];
-	const records = entries.map(asRecord);
+		const records = entries.map(asRecord);
 		const matched = records.find((entry) => String(entry.fid ?? '') === file.fid);
 		const info = matched ?? (records.length === 1 && records[0].fid === undefined ? records[0] : undefined);
 		if (!info) throw new Error(`夸克下载地址未返回匹配文件：${file.name}`);
 		const url = info?.download_url;
 		if (typeof url !== 'string' || !url) throw new Error(`夸克未返回下载地址：${file.name}`);
-		const response = await this.transport.request({
+		return await this.transport.request({
 			url,
 			method: 'GET',
 			cookie: this.cookie,
@@ -310,9 +344,6 @@ export class QuarkClient {
 				'User-Agent': QUARK_WEB_USER_AGENT,
 			},
 		});
-		if (response.status !== 200) throw new Error(`夸克下载失败（HTTP ${response.status}）：${file.name}`);
-		if (response.data.byteLength !== file.size) throw new Error(`夸克下载长度不匹配：${file.name}`);
-		return response.data;
 	}
 
 	private async confirmUploaded(parentId: string, name: string, size: number, fid?: string): Promise<RemoteFile> {
@@ -420,6 +451,22 @@ export class QuarkClient {
 		}
 		return payload;
 	}
+}
+
+const DOWNLOAD_FAILURES = new Map([
+	['AccessDenied', { label: '访问被拒绝（AccessDenied）', retryable: false }],
+	['InvalidAccessKeyId', { label: '下载凭据无效（InvalidAccessKeyId）', retryable: false }],
+	['RequestExpired', { label: '下载地址已过期（RequestExpired）', retryable: true }],
+	['SecurityTokenExpired', { label: '下载凭据已过期（SecurityTokenExpired）', retryable: true }],
+	['ExpiredToken', { label: '下载凭据已过期（ExpiredToken）', retryable: true }],
+	['SignatureDoesNotMatch', { label: '下载签名不匹配（SignatureDoesNotMatch）', retryable: true }],
+]);
+
+function readDownloadFailure(bytes: Uint8Array): { label: string; retryable: boolean } | undefined {
+	const text = new TextDecoder().decode(bytes.subarray(0, 2048));
+	const code = /<Code>\s*([A-Za-z]+)\s*<\/Code>/i.exec(text)?.[1] ??
+		/"code"\s*:\s*"([A-Za-z]+)"/i.exec(text)?.[1] ?? text.trim();
+	return DOWNLOAD_FAILURES.get(code);
 }
 
 function readTotal(data: Record<string, unknown>): number | undefined {

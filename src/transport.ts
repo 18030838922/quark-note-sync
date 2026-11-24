@@ -136,8 +136,10 @@ export class QuarkTransport {
 		const responseHeaders = normalizeHeaders(response.headers);
 		const responseUrl = typeof response.url === 'string' ? response.url : request.url;
 		const contentType = responseHeaders['content-type'] ?? '';
-		const bytes = normalizeNativeBody(response.data, request.responseKind ?? 'text', contentType);
-		return makeResponse(Number(response.status ?? 0), responseHeaders, responseUrl, bytes);
+		const status = Number(response.status ?? 0);
+		const responseKind = status >= 200 && status < 300 ? request.responseKind ?? 'text' : 'text';
+		const bytes = normalizeNativeBody(response.data, responseKind, contentType);
+		return makeResponse(status, responseHeaders, responseUrl, bytes);
 	}
 
 	private async requestWithNodeHttps(

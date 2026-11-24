@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { buildSync } from 'esbuild';
 import type QuarkNoteSyncPlugin from '../src/main.ts';
+import type { QuarkDashboardActions, QuarkDashboardView } from '../src/dashboard.ts';
 
 const bundle = buildSync({
 	entryPoints: ['src/main.ts'],
@@ -66,28 +67,52 @@ async function loadPlugin(data: object, savedCookie: string | null = 'sid=fixtur
 			return this;
 		}
 	}
-	const commands = new Map<string, { checkCallback?: (checking: boolean) => boolean }>();
+	const commands = new Map<string, { callback?: () => void; checkCallback?: (checking: boolean) => boolean }>();
 	const readyCallbacks: Array<() => void> = [];
+	const sideRequests: Array<{ type: string; side: string; reveal?: boolean }> = [];
+	type Sidebar = { actions: QuarkDashboardActions; view: QuarkDashboardView };
+	let factory: ((leaf: object) => Sidebar) | undefined;
+	let sidebarLeaf: { view?: Sidebar } | undefined;
+	let revealed = 0;
+	let modalOpens = 0;
 	const intervals = new Map<number, () => void>();
 	let nextInterval = 0;
 	const state: Record<string, unknown> = { ...data, deviceId: 'test-device' };
 	let cookie = savedCookie;
 	let requestStatus = 200;
 	let requests = 0;
+	let quotaRequests = 0;
 	const app = {
-		workspace: { onLayoutReady: (callback: () => void) => readyCallbacks.push(callback) },
+		workspace: {
+			onLayoutReady: (callback: () => void) => readyCallbacks.push(callback),
+			getLeavesOfType: () => sidebarLeaf ? [sidebarLeaf] : [],
+			async ensureSideLeaf(type: string, side: string, options: { reveal?: boolean }) {
+				sideRequests.push({ type, side, reveal: options.reveal });
+				return sidebarLeaf ??= {};
+			},
+			async revealLeaf(leaf: { view?: Sidebar }) {
+				revealed += 1;
+				leaf.view ??= factory?.(leaf);
+			},
+		},
 		secretStorage: {
 			getSecret: () => cookie,
 			setSecret: (_id: string, value: string) => { cookie = value || null; },
 		},
-		vault: { configDir: '.obsidian' },
+		vault: {
+			configDir: '.obsidian',
+			getName: () => 'Test vault',
+			getFiles: () => [{ path: 'Notes/Test.md', extension: 'md', stat: { size: 42 } }],
+		},
 	};
 	class Plugin {
 		app = app;
 		async loadData() { return state; }
 		async saveData(value: object) { Object.assign(state, value); }
+		addRibbonIcon() {}
+		registerView(_type: string, createView: typeof factory) { factory = createView; }
 		addSettingTab(tab: typeof settingsTab) { settingsTab = tab; }
-		addCommand(command: { id: string; checkCallback?: (checking: boolean) => boolean }) {
+		addCommand(command: { id: string; callback?: () => void; checkCallback?: (checking: boolean) => boolean }) {
 			commands.set(command.id, command);
 		}
 	}
@@ -95,7 +120,12 @@ async function loadPlugin(data: object, savedCookie: string | null = 'sid=fixtur
 		Plugin,
 		PluginSettingTab: SettingsTab,
 		Setting,
-		Modal: class {},
+		ItemView: class {
+			containerEl = { addClass() {} };
+			contentEl = { addClass() {}, createDiv: () => ({}) };
+		},
+		Modal: class { open() { modalOpens += 1; } close() {} },
+		setIcon() {},
 		Notice: class { constructor(message: string) { notices.push(message); } },
 		Platform: { isDesktopApp: true, isMobileApp: false, isAndroidApp: false },
 	};
@@ -117,6 +147,11 @@ async function loadPlugin(data: object, savedCookie: string | null = 'sid=fixtur
 				requests += 1;
 				if (requestStatus === 0) throw new Error('offline');
 				const url = new URL(request.url);
+				if (url.pathname === '/1/clouddrive/member') {
+					quotaRequests += 1;
+					return { status: requestStatus, headers: {}, text: () =>
+						JSON.stringify({ code: 0, data: { total_capacity: 1000, use_capacity: 250 } }) };
+				}
 				const pdirFid = url.searchParams.get('pdir_fid');
 				const list = pdirFid === '0' ? [{ fid: 'root-1', file_name: 'Obsidian Notes', file_type: 0, dir: true }] : [];
 				const body = url.pathname === '/account/info'
@@ -132,6 +167,9 @@ async function loadPlugin(data: object, savedCookie: string | null = 'sid=fixtur
 		fireLayoutReady: () => readyCallbacks.forEach((callback) => callback()),
 		setRequestStatus: (status: number) => { requestStatus = status; },
 		requestCount: () => requests,
+		quotaRequestCount: () => quotaRequests,
+		sideRequests, revealedCount: () => revealed, modalCount: () => modalOpens,
+		readSidebar: () => sidebarLeaf?.view,
 		showSettings: () => settingsTab.display(),
 		settingsText: () => renderedText(settingsTab.containerEl),
 		switchLanguage: (value: string) => changeLanguage(value),
@@ -232,4 +270,55 @@ test('settings display Chinese by default, switch immediately, and remember the 
 	await reopened.switchLanguage('zh-CN');
 	assert.equal(reopened.state.language, 'zh-CN');
 	assert.ok(reopened.settingsText().includes('立即同步夸克'));
+});
+
+
+
+test('the dashboard is registered on the left and reveals a single tab', async () => {
+	const loggedIn = await loadPlugin({});
+	loggedIn.fireLayoutReady();
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.deepEqual(loggedIn.sideRequests, [{ type: 'quark-note-sync-dashboard', side: 'left', reveal: false }]);
+	assert.equal(loggedIn.quotaRequestCount(), 0);
+	assert.equal(loggedIn.revealedCount(), 0);
+
+	const open = loggedIn.commands.get('open-dashboard')?.callback;
+	assert.ok(open);
+	open();
+	open();
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(loggedIn.revealedCount(), 1);
+	assert.equal(loggedIn.sideRequests.length, 1);
+	assert.equal(loggedIn.quotaRequestCount(), 1);
+
+	const loggedOut = await loadPlugin({}, null);
+	await loggedOut.plugin.openDashboard();
+	assert.equal(loggedOut.requestCount(), 0);
+});
+
+test('first sync uses the sidebar preview and cannot run until confirmed there', async () => {
+	const fixture = await loadPlugin({});
+	let previewCalls = 0;
+	let syncCalls = 0;
+	const plan = { events: [], paths: [], skipped: [], nextSnapshots: {} };
+	Object.assign(fixture.plugin, { createService: () => ({
+		async preview() { previewCalls += 1; return plan; },
+		async sync() {
+			syncCalls += 1;
+			return { uploaded: 0, downloaded: 0, deleted: 0, conflicts: 0, skipped: [] };
+		},
+	}) });
+	await fixture.plugin.openDashboard();
+	await fixture.readSidebar()?.actions.preview?.();
+	await fixture.readSidebar()?.actions.confirmSync?.();
+	assert.equal(syncCalls, 0);
+	await fixture.readSidebar()?.actions.sync?.();
+	assert.equal(previewCalls, 2);
+	assert.equal(syncCalls, 0);
+	assert.equal(fixture.readSidebar()?.view.inline?.confirm, true);
+	await fixture.readSidebar()?.actions.confirmSync?.();
+	assert.equal(syncCalls, 1);
+	assert.equal(fixture.state.initialSyncCompleted, true);
+	assert.equal(fixture.readSidebar()?.view.inline, undefined);
+	assert.equal(fixture.modalCount(), 0);
 });

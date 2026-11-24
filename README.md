@@ -14,6 +14,12 @@ The plugin uses Quark Drive's unofficial web API. Changes to that API or to acco
 - Sign in by QR code on Windows and import an encrypted authorization code on Android. Manage the saved session in the Quark account section of the plugin settings.
 - Preserve concurrent edits as local conflict copies. The vault's Obsidian configuration and conflict copies are excluded from sync.
 
+## Sync dashboard
+
+Select the cloud icon in the left ribbon or run **Open sync dashboard** to show the dashboard in the left sidebar. Run a sync, review and confirm the first-sync preview, or adjust automatic sync directly in that tab. The sidebar also shows the latest sync results, Quark Drive capacity, vault usage by file type, and the five largest files.
+
+Vault usage comes from the file sizes Obsidian has indexed. The dashboard does not read note contents. Quark storage is account-wide and is shown only when the drive reports valid totals.
+
 ## Install
 
 1. Download `main.js`, `manifest.json`, and `styles.css` from [GitHub Releases](https://github.com/18030838922/quark-note-sync/releases/latest).

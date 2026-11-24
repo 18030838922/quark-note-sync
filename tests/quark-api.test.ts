@@ -20,6 +20,37 @@ const response = (body: unknown, status = 200): HttpResponse => {
 	return { status, headers: { 'content-type': 'application/json' }, url: '', data, text: () => text };
 };
 
+test('storage quota reads the declared byte counters from the read-only member endpoint', async () => {
+	const transport = new FixtureTransport(() => response({ code: 0, data: { total_capacity: 1000, use_capacity: 375 } }));
+	const quota = await new QuarkClient(transport, 'sid=secret').getStorageQuota();
+
+	assert.deepEqual(quota, { totalBytes: 1000, usedBytes: 375 });
+	assert.equal(transport.requests.length, 1);
+	const request = transport.requests[0];
+	const url = new URL(request.url);
+	assert.equal(request.method, 'GET');
+	assert.equal(url.origin, 'https://drive-pc.quark.cn');
+	assert.equal(url.pathname, '/1/clouddrive/member');
+	assert.equal(url.searchParams.get('pr'), 'ucpro');
+	assert.equal(url.searchParams.get('fr'), 'pc');
+	assert.equal(request.cookie, 'sid=secret');
+});
+
+test('storage quota is unavailable when the endpoint fails or returns invalid byte counters', async () => {
+	const failed = new FixtureTransport(() => { throw new Error('endpoint unavailable'); });
+	assert.equal(await new QuarkClient(failed, 'sid=secret').getStorageQuota(), undefined);
+
+	for (const data of [
+		{},
+		{ total_capacity: 'unknown', use_capacity: 0 },
+		{ total_capacity: -1, use_capacity: 0 },
+		{ total_capacity: 100, use_capacity: 101 },
+	]) {
+		const transport = new FixtureTransport(() => response({ code: 0, data }));
+		assert.equal(await new QuarkClient(transport, 'sid=secret').getStorageQuota(), undefined);
+	}
+});
+
 test('directory listing follows all declared pages before returning files', async () => {
 	const transport = new FixtureTransport((_request, index) => {
 		const start = index * 50;
@@ -272,4 +303,53 @@ test('download refuses a URL returned for a different file and uses the approved
 	const downloadRequest = correct.requests.find((request) => request.purpose === 'download')!;
 	assert.equal(downloadRequest.cookie, 'sid=secret');
 	assert.equal(downloadRequest.headers?.Referer, 'https://pan.quark.cn/');
+});
+
+
+test('a forbidden file download renews its link once and preserves the signed URL exactly', async () => {
+	const stale = 'https://bucket.pds.quark.cn/object?sig=old%2B%2F%3D&key=one+two';
+	const fresh = 'https://bucket.pds.quark.cn/object?sig=new%2B%2F%3D&key=one+two';
+	let links = 0;
+	const transport = new FixtureTransport((request) => {
+		if (request.purpose === 'api') {
+			assert.deepEqual(JSON.parse(String(request.body)), { fids: ['file-id'] });
+			return response({ code: 0, data: [{ fid: 'file-id', download_url: links++ === 0 ? stale : fresh }] });
+		}
+		if (request.url === stale) return response({}, 403);
+		assert.equal(request.url, fresh);
+		return { status: 200, headers: {}, url: request.url, data: Uint8Array.of(1, 2, 3), text: () => '' };
+	});
+	const bytes = await new QuarkClient(transport, 'sid=fixture').downloadFile({
+		fid: 'file-id', name: 'manifest.json', isDirectory: false, size: 3,
+	});
+	assert.deepEqual(bytes, Uint8Array.of(1, 2, 3));
+	assert.equal(links, 2);
+});
+
+test('a persistent forbidden download stops after one retry and exposes only a safe reason', async () => {
+	const url = 'https://bucket.pds.quark.cn/object?sig=do-not-show';
+	const body = '<Error><Code>SignatureDoesNotMatch</Code><Message>sid=do-not-show</Message></Error>';
+	const transport = new FixtureTransport((request) => request.purpose === 'api'
+		? response({ code: 0, data: [{ fid: 'file-id', download_url: url }] })
+		: { status: 403, headers: {}, url, data: new TextEncoder().encode(body), text: () => body });
+	await assert.rejects(
+		() => new QuarkClient(transport, 'sid=fixture').downloadFile({
+			fid: 'file-id', name: 'manifest.json', isDirectory: false, size: 3,
+		}),
+		(error: Error) => /403/.test(error.message) && /SignatureDoesNotMatch/.test(error.message) && !error.message.includes('do-not-show'),
+	);
+	assert.equal(transport.requests.length, 4);
+});
+
+test('an explicit Quark access denial is reported without making another download request', async () => {
+	const url = 'https://bucket.pds.quark.cn/object';
+	const transport = new FixtureTransport((request) => request.purpose === 'api'
+		? response({ code: 0, data: [{ fid: 'file-id', download_url: url }] })
+		: response({ code: 'AccessDenied', message: 'raw details' }, 403));
+	await assert.rejects(
+		() => new QuarkClient(transport, 'sid=fixture').downloadFile({
+			fid: 'file-id', name: 'manifest.json', isDirectory: false, size: 3,
+		}), /AccessDenied/,
+	);
+	assert.equal(transport.requests.length, 2);
 });

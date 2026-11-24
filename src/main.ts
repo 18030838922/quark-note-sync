@@ -8,6 +8,7 @@ import {
 	Setting,
 	type App,
 	type TextComponent,
+	type WorkspaceLeaf,
 } from 'obsidian';
 import QRCode from 'qrcode';
 import type { PendingApplyState, SyncSummary } from './sync-service.ts';
@@ -18,6 +19,8 @@ import { QuarkTransport, type HttpRequest, type HttpResponse } from './transport
 import { QuarkQrLogin, type QuarkQrSession } from './quark-login.ts';
 import { createPairingCode, readPairingCode } from './pairing-code.ts';
 import { settingsText, type Language } from './settings-text.ts';
+import { DASHBOARD_VIEW_TYPE, QuarkDashboardSidebar, type QuarkDashboardActions, type QuarkDashboardView } from './dashboard.ts';
+import { summarizeVaultFiles } from './dashboard-stats.ts';
 
 const PLUGIN_ID = 'quark-note-sync';
 const DEFAULT_CLOUD_DIRECTORY = 'Obsidian Notes';
@@ -33,6 +36,7 @@ interface PluginSettings {
 	autoSyncIntervalMinutes: number;
 	initialSyncCompleted: boolean;
 	lastSummary: SyncSummary | null;
+	lastSyncedAt: number | null;
 	deviceId: string;
 	boundAccountId: string | null;
 	boundRootFid: string | null;
@@ -48,6 +52,13 @@ interface InspectedCredential {
 	nickname?: string;
 }
 
+interface DashboardPreview {
+	plan: SyncPlan;
+	confirm: boolean;
+	directory: string;
+	credentialRevision: number;
+}
+
 type AccountView = { state: 'signed-out' | 'expired' } | { state: 'connected'; label: string };
 
 export default class QuarkNoteSyncPlugin extends Plugin {
@@ -61,6 +72,14 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 	private layoutReady = false;
 	private accountNickname: string | undefined;
 	private settingsTab!: QuarkSettingsTab;
+	private dashboard: QuarkDashboardSidebar | undefined;
+	private dashboardLeafPending: Promise<WorkspaceLeaf> | undefined;
+	private dashboardOpening: Promise<void> | undefined;
+	private dashboardPreview: DashboardPreview | undefined;
+	private dashboardVault: ReturnType<typeof summarizeVaultFiles> | undefined;
+	private dashboardQuota: { usedBytes: number; freeBytes: number } | undefined;
+	private dashboardQuotaLoading = false;
+	private dashboardRequest = 0;
 
 	async onload(): Promise<void> {
 		const data = (await this.loadData()) as PersistedData | null;
@@ -68,6 +87,11 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		this.credentialId = `${PLUGIN_ID}-cookie-${this.config.deviceId}`;
 		this.settingsTab = new QuarkSettingsTab(this.app, this);
 		this.addSettingTab(this.settingsTab);
+
+		const dashboardName = this.config.language === 'en' ? 'Open sync dashboard' : '打开同步面板';
+		this.registerView(DASHBOARD_VIEW_TYPE, (leaf) => this.createDashboardView(leaf));
+		this.addRibbonIcon('cloud', dashboardName, () => void this.openDashboard());
+		this.addCommand({ id: 'open-dashboard', name: dashboardName, callback: () => void this.openDashboard() });
 
 		this.addCommand({
 			id: 'preview-sync',
@@ -106,6 +130,7 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 
 		this.app.workspace.onLayoutReady(() => {
 			this.layoutReady = true;
+			if (!this.unloading && Platform.isDesktopApp) void this.ensureDashboardLeaf().catch(() => undefined);
 			this.runStartupSync();
 		});
 		this.refreshAutoSyncTimer();
@@ -113,9 +138,190 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 
 	onunload(): void {
 		this.unloading = true;
+		this.dashboard = undefined;
+		this.dashboardPreview = undefined;
+		this.dashboardRequest += 1;
 		if (this.autoSyncTimer !== undefined) {
 			window.clearInterval(this.autoSyncTimer);
 			this.autoSyncTimer = undefined;
+		}
+	}
+
+	async openDashboard(): Promise<void> {
+		if (this.unloading) return;
+		this.dashboardOpening ??= this.revealDashboard().finally(() => { this.dashboardOpening = undefined; });
+		await this.dashboardOpening;
+	}
+
+	private async revealDashboard(): Promise<void> {
+		try {
+			const leaf = await this.ensureDashboardLeaf();
+			if (this.unloading) return;
+			await this.app.workspace.revealLeaf(leaf);
+			if (leaf.view instanceof QuarkDashboardSidebar) {
+				this.dashboard = leaf.view;
+				void this.refreshDashboard();
+			}
+		} catch {
+			if (this.unloading) return;
+			new Notice(this.config.language === 'en' ? 'Could not open the sync sidebar.' : '无法打开夸克同步侧栏。');
+		}
+	}
+
+	private ensureDashboardLeaf(): Promise<WorkspaceLeaf> {
+		const workspace = this.app.workspace;
+		const existing = workspace.getLeavesOfType(DASHBOARD_VIEW_TYPE)[0];
+		if (existing) return Promise.resolve(existing);
+		this.dashboardLeafPending ??= workspace.ensureSideLeaf(DASHBOARD_VIEW_TYPE, 'left', { active: false, reveal: false })
+			.finally(() => { this.dashboardLeafPending = undefined; });
+		return this.dashboardLeafPending;
+	}
+
+	private createDashboardView(leaf: WorkspaceLeaf): QuarkDashboardSidebar {
+		const clear = () => {
+			if (this.dashboard !== view) return;
+			this.dashboard = undefined;
+			this.dashboardVault = undefined;
+			this.dashboardQuota = undefined;
+			this.dashboardQuotaLoading = false;
+			this.dashboardPreview = undefined;
+			this.dashboardRequest += 1;
+		};
+		const view = new QuarkDashboardSidebar(leaf, this.dashboardView(), {
+			...this.dashboardActions(),
+			ready: () => {
+				if (this.unloading) return;
+				this.dashboard = view;
+				queueMicrotask(() => {
+					if (this.dashboard === view && !this.dashboardOpening && view.contentEl.isShown()) {
+						void this.refreshDashboard();
+					}
+				});
+			},
+			close: clear,
+		});
+		return view;
+	}
+
+	private dashboardView(): QuarkDashboardView {
+		const { language, autoSync, autoSyncIntervalMinutes, syncOnStartup, lastSummary, lastSyncedAt } = this.config;
+		const account = this.accountView;
+		const usage = this.dashboardVault ?? summarizeVaultFiles(this.app.vault.getFiles());
+		const labels = language === 'en'
+			? { notes: 'Notes', images: 'Images', documents: 'Documents', media: 'Audio and video', other: 'Other' }
+			: { notes: '笔记', images: '图片', documents: '文档', media: '音视频', other: '其他' };
+		return {
+			language,
+			account: { status: account.state, label: account.state === 'connected' ? account.label : undefined },
+			vaultName: this.app.vault.getName(),
+			periodicSync: { enabled: autoSync, intervalMinutes: autoSyncIntervalMinutes, syncOnStartup },
+			busy: this.busy,
+			canEnableAutoSync: this.config.initialSyncCompleted,
+			inline: this.dashboardPreview
+				? { plan: this.dashboardPreview.plan, confirm: this.dashboardPreview.confirm }
+				: undefined,
+			skippedDetails: lastSummary?.skipped,
+			cloudQuota: account.state === 'connected' ? this.dashboardQuota : undefined,
+			quotaLoading: this.dashboardQuotaLoading,
+			vault: {
+				fileCount: usage.fileCount,
+				totalBytes: usage.totalBytes,
+				byKind: usage.byKind.map((entry) => ({
+					kind: entry.kind, label: labels[entry.kind], files: entry.count, bytes: entry.bytes,
+				})),
+				largestFiles: usage.largest.map((entry) => ({
+					path: entry.path, name: entry.path.split('/').pop() ?? entry.path, bytes: entry.bytes,
+				})),
+			},
+			latestSync: lastSummary ? {
+				at: lastSyncedAt ?? undefined,
+				uploaded: lastSummary.uploaded,
+				downloaded: lastSummary.downloaded,
+				deleted: lastSummary.deleted,
+				conflicts: lastSummary.conflicts,
+				skipped: lastSummary.skipped.length,
+			} : undefined,
+		};
+	}
+
+	private dashboardActions(): QuarkDashboardActions {
+		const state = this.accountView.state;
+		const mobile = Platform.isMobileApp;
+		return {
+			refresh: () => this.refreshDashboard(),
+			sync: () => this.syncFromDashboard(),
+			preview: () => this.previewInDashboard(false),
+			confirmSync: () => this.confirmDashboardSync(),
+			dismissPlan: () => {
+				this.dashboardPreview = undefined;
+				this.redrawDashboard();
+			},
+			checkConnection: () => this.checkConnection(),
+			setPeriodicSync: async (enabled) => {
+				await this.setAutoSync(enabled);
+				this.redrawDashboard();
+			},
+			setStartupSync: async (enabled) => {
+				await this.setSyncOnStartup(enabled);
+				this.redrawDashboard();
+			},
+			settings: () => this.openPluginSettings(),
+			login: !mobile && state !== 'connected' ? () => this.openQrLogin() : undefined,
+			exportPairing: !mobile && state === 'connected' ? () => new ExportPairingModal(this.app, this).open() : undefined,
+			importPairing: mobile && state !== 'connected' ? () => new ImportPairingModal(this.app, this).open() : undefined,
+			logout: state !== 'signed-out' ? () => this.signOut() : undefined,
+			openFile: async (path) => {
+				const file = this.app.vault.getFileByPath(path);
+				if (!file) {
+					new Notice(this.config.language === 'en' ? 'This file is no longer in the vault.' : '该文件已不在笔记库中。');
+					return;
+				}
+				const leaf = this.app.workspace.getMostRecentLeaf() ?? this.app.workspace.getLeaf('tab');
+				await leaf.openFile(file).catch(() => {
+					new Notice(this.config.language === 'en' ? 'Could not open the file.' : '无法打开文件。');
+				});
+			},
+		};
+	}
+
+	private openPluginSettings(): void {
+		// Older desktop and mobile builds expose the settings controller without public typings.
+		const settings = (this.app as App & { setting?: { open?: () => void; openTabById?: (id: string) => void } }).setting;
+		if (typeof settings?.open === 'function' && typeof settings.openTabById === 'function') {
+			settings.open();
+			settings.openTabById(PLUGIN_ID);
+		} else {
+			new Notice(this.config.language === 'en'
+				? 'Open Settings → Community plugins → Quark Note Sync.'
+				: '请打开设置 → 第三方插件 → Quark Note Sync。');
+		}
+	}
+
+	private redrawDashboard(): void {
+		if (this.dashboard) this.dashboard.refreshView(this.dashboardView(), this.dashboardActions());
+	}
+
+	private async refreshDashboard(refreshLocal = true): Promise<void> {
+		if (!this.dashboard || this.unloading) return;
+		const request = ++this.dashboardRequest;
+		const revision = this.credentialRevision;
+		if (refreshLocal) this.dashboardVault = summarizeVaultFiles(this.app.vault.getFiles());
+		const cookie = this.accountView.state === 'connected' ? this.readCookie() : null;
+		this.dashboardQuotaLoading = cookie !== null;
+		this.dashboardQuota = undefined;
+		this.redrawDashboard();
+		if (!cookie) return;
+		try {
+			const quota = await this.createClient(cookie).getStorageQuota();
+			if (request !== this.dashboardRequest || revision !== this.credentialRevision || !quota) return;
+			this.dashboardQuota = { usedBytes: quota.usedBytes, freeBytes: quota.totalBytes - quota.usedBytes };
+		} catch {
+			// The dashboard can still display local statistics when the quota endpoint is unavailable.
+		} finally {
+			if (request === this.dashboardRequest) {
+				this.dashboardQuotaLoading = false;
+				this.redrawDashboard();
+			}
 		}
 	}
 
@@ -175,7 +381,9 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 			this.app.secretStorage.setSecret(this.credentialId, '');
 			this.credentialRevision += 1;
 			this.accountNickname = undefined;
+			this.dashboardQuota = undefined;
 			this.config.sessionExpired = false;
+			this.dashboardPreview = undefined;
 			this.refreshAutoSyncTimer();
 			await this.persistData();
 			new Notice('已退出本设备的夸克登录');
@@ -199,6 +407,8 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		}, () => {
 			this.busy = false;
 			this.settingsTab.refreshAccount();
+			if (this.dashboard && this.accountView.state === 'connected') void this.refreshDashboard(false);
+			else this.redrawDashboard();
 			this.runStartupSync();
 		});
 		modal.open();
@@ -368,11 +578,57 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		new Notice(`自动同步间隔已设为 ${this.config.autoSyncIntervalMinutes} 分钟`);
 	}
 
-	async previewSync(): Promise<void> {
-		const plan = await this.runExclusive('读取同步预览', async () => {
-			const service = this.createService(this.requireCookie());
-			return await service.preview();
+	private readSyncPreview(firstSync: boolean): Promise<SyncPlan | undefined> {
+		return this.runExclusive(firstSync ? '读取首次同步预览' : '读取同步预览', async () => {
+			return await this.createService(this.requireCookie()).preview();
 		}, true);
+	}
+
+	private async previewInDashboard(confirm: boolean): Promise<void> {
+		const dashboard = this.dashboard;
+		if (!dashboard || this.busy || this.unloading) return;
+		const directory = this.config.cloudDirectoryName;
+		const credentialRevision = this.credentialRevision;
+		this.dashboardPreview = undefined;
+		const plan = await this.readSyncPreview(confirm);
+		if (!plan || this.dashboard !== dashboard || this.unloading) return;
+		this.dashboardPreview = { plan, confirm, directory, credentialRevision };
+		this.redrawDashboard();
+	}
+
+	private async syncFromDashboard(): Promise<void> {
+		if (this.busy || this.unloading) return;
+		if (!this.config.initialSyncCompleted) {
+			await this.previewInDashboard(true);
+			return;
+		}
+		this.dashboardPreview = undefined;
+		const summary = await this.performSync(false, false, false);
+		if (summary) void this.refreshDashboard(false);
+	}
+
+	private async confirmDashboardSync(): Promise<void> {
+		const preview = this.dashboardPreview;
+		if (!preview?.confirm || this.busy || this.unloading) return;
+		this.dashboardPreview = undefined;
+		if (!this.isCurrentSyncPreview(preview.directory, preview.credentialRevision)) {
+			this.redrawDashboard();
+			return;
+		}
+		const summary = await this.performSync(!this.config.initialSyncCompleted, false, false);
+		if (summary) void this.refreshDashboard(false);
+	}
+
+	private isCurrentSyncPreview(directory: string, credentialRevision: number): boolean {
+		if (directory === this.config.cloudDirectoryName && credentialRevision === this.credentialRevision) return true;
+		new Notice(this.config.language === 'en'
+			? 'The cloud folder or session changed. Preview again before syncing.'
+			: '云端目录或登录状态已更改，请重新预览后再同步。');
+		return false;
+	}
+
+	async previewSync(): Promise<void> {
+		const plan = await this.readSyncPreview(false);
 		if (plan && !this.unloading) new PlanModal(this.app, plan, false).open();
 	}
 
@@ -381,23 +637,16 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 			await this.performSync(false);
 			return;
 		}
-		const previewDirectoryName = this.config.cloudDirectoryName;
-		const previewCredentialRevision = this.credentialRevision;
-		const plan = await this.runExclusive('读取首次同步预览', async () => {
-			const service = this.createService(this.requireCookie());
-			return await service.preview();
-		}, true);
+		const directory = this.config.cloudDirectoryName;
+		const credentialRevision = this.credentialRevision;
+		const plan = await this.readSyncPreview(true);
 		if (!plan || this.unloading) return;
 		new PlanModal(this.app, plan, true, () => {
-			if (this.config.cloudDirectoryName !== previewDirectoryName || this.credentialRevision !== previewCredentialRevision) {
-				new Notice('云端目录或 Cookie 已更改；请重新预览后再确认首次同步');
-				return;
-			}
-			void this.performSync(true, false);
+			if (this.isCurrentSyncPreview(directory, credentialRevision)) void this.performSync(true);
 		}).open();
 	}
 
-	private async performSync(confirmedInitialSync: boolean, automatic = false): Promise<void> {
+	private async performSync(confirmedInitialSync: boolean, automatic = false, showSummary = true): Promise<SyncSummary | undefined> {
 		if (this.unloading || (automatic && !this.canRunAutomaticSync())) return;
 		if (!this.config.initialSyncCompleted && !confirmedInitialSync) {
 			await this.requestSync();
@@ -419,13 +668,16 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 					this.credentialRevision += 1;
 				}
 				this.config.lastSummary = result;
+				this.config.lastSyncedAt = Date.now();
+				if (this.dashboard) this.dashboardVault = summarizeVaultFiles(this.app.vault.getFiles());
 				if (confirmedInitialSync) this.config.initialSyncCompleted = true;
 				await this.persistData();
 				if (confirmedInitialSync) this.refreshAutoSyncTimer();
 			}
 			return result;
 		}, true);
-		if (summary && !this.unloading && !automatic) new SyncSummaryModal(this.app, summary).open();
+		if (summary && !this.unloading && !automatic && showSummary) new SyncSummaryModal(this.app, summary).open();
+		return summary;
 	}
 
 	showLastSummary(): void {
@@ -598,6 +850,7 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		this.busy = true;
 		const previousAccount = this.accountView;
 		try {
+			this.redrawDashboard();
 			return await operation();
 		} catch (error) {
 			if (!this.unloading) {
@@ -620,6 +873,11 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 				(previousAccount.state === 'connected' && currentAccount.state === 'connected' &&
 					previousAccount.label !== currentAccount.label)) {
 				this.settingsTab.refreshAccount();
+			}
+			if (this.dashboard && previousAccount.state !== 'connected' && currentAccount.state === 'connected') {
+				void this.refreshDashboard(false);
+			} else {
+				this.redrawDashboard();
 			}
 			this.runStartupSync();
 		}
@@ -667,6 +925,7 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 			autoSyncIntervalMinutes: this.config.autoSyncIntervalMinutes,
 			initialSyncCompleted: this.config.initialSyncCompleted,
 			lastSummary: this.config.lastSummary,
+			lastSyncedAt: this.config.lastSyncedAt,
 			deviceId: this.config.deviceId,
 			boundAccountId: this.config.boundAccountId,
 			boundRootFid: this.config.boundRootFid,
@@ -691,6 +950,9 @@ class QuarkSettingsTab extends PluginSettingTab {
 		const language = this.plugin.settingsView.language;
 		const copy = settingsText[language];
 		new Setting(containerEl).setName(copy.title).setHeading();
+		new Setting(containerEl).addButton((button) => button
+			.setButtonText(language === 'en' ? 'Open sync dashboard' : '打开同步面板')
+			.onClick(() => void this.plugin.openDashboard()));
 		new Setting(containerEl)
 			.setName('语言 / Language')
 			.addDropdown((dropdown) => dropdown
@@ -1225,6 +1487,8 @@ function normalizeSettings(data: PersistedData): PluginSettings {
 		autoSyncIntervalMinutes: interval,
 		initialSyncCompleted: data.initialSyncCompleted === true,
 		lastSummary: normalizeSummary(data.lastSummary),
+		lastSyncedAt: typeof data.lastSyncedAt === 'number' && Number.isSafeInteger(data.lastSyncedAt) && data.lastSyncedAt > 0 && data.lastSyncedAt <= 8.64e15
+			? data.lastSyncedAt : null,
 		deviceId,
 		boundAccountId: typeof data.boundAccountId === 'string' && isSafeIdentity(data.boundAccountId)
 			? data.boundAccountId : null,
