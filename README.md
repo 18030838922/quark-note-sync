@@ -18,7 +18,7 @@ The plugin uses Quark Drive's unofficial web API. Changes to that API or to acco
 
 1. Download the ZIP from [GitHub Releases](https://github.com/18030838922/quark-note-sync/releases/latest) and extract it.
 2. Copy the extracted `quark-note-sync` folder into `<vault>/.obsidian/plugins/`. Its `manifest.json` and `main.js` should sit directly inside that folder. On Android, use the folder for the vault Obsidian has actually opened. Your file manager may need to show hidden files.
-3. In Obsidian Settings → Community plugins, turn off Restricted mode if needed and enable the newly installed plugin.
+3. In Obsidian Settings → Community plugins, turn off Restricted mode if needed and enable **Quark Note Sync**.
 
 Requires Obsidian 1.11.4 or later. To update a manual installation, replace `manifest.json` and `main.js`, keep any existing `data.json`, and reload Obsidian.
 

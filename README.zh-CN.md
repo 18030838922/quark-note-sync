@@ -27,7 +27,7 @@
    <Vault>/.obsidian/plugins/quark-note-sync/main.js
    ```
 
-3. 在 Obsidian 设置 → 第三方插件中，关闭受限模式（如尚未关闭），重新加载插件列表并启用“夸克笔记同步”。
+3. 在 Obsidian 设置 → 第三方插件中，关闭受限模式（如尚未关闭），重新加载插件列表并启用“Quark Note Sync”。
 4. Android 的 Vault 文件夹与桌面版一样有 `.obsidian/plugins/` 目录。将插件解压并复制到 Vault 实际所在的设备存储路径；使用能显示隐藏文件、且能访问 Vault 所在存储位置的文件管理器操作，部分设备需要在系统文件选择器中先授予该 Vault 的访问权限。
 
 插件使用 Obsidian SecretStorage 保存 Cookie，因此要求 Obsidian 1.11.4 或更新版本；该版本要求也写在 `manifest.json` 中。
@@ -36,7 +36,7 @@
 
 插件设置默认使用简体中文。可通过页面顶部的「语言 / Language」切换为 English，所选语言会自动保存。
 
-1. Windows Obsidian 设置中点击“扫码登录”，用自己的夸克 App 扫码并确认。插件只在读取账号信息和夸克根目录成功后，才会将网页登录会话保存在本机 Obsidian SecretStorage。
+1. 在 Windows Obsidian 的 Quark Note Sync 设置页中点击“扫码登录”，用自己的夸克 App 扫码并确认。插件只在读取账号信息和夸克根目录成功后，才会将网页登录会话保存在本机 Obsidian SecretStorage。
 2. 填写专用夸克云端目录名称，并设置设备名称。若尚未有目标目录，请先在夸克官方网页端手动创建；插件的“导出到手机”只读取目标目录，不会为了导出而创建云端文件夹。首次同步也可在确认后创建目标目录，再导出授权。
 3. 运行“检查夸克连接”和“预览同步”。确认预览中的目标和文件变化后，再手动确认首次同步。
 4. 在 Android Obsidian 中安装并启用本插件，点击“导入电脑授权”，粘贴 Windows 端导出的授权码并输入相同密码。导入前会在线验证账号 ID 和云端根目录 ID；不会自动开始同步。新设备的自动同步保持关闭，需先预览并手动确认首次同步。
