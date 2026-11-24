@@ -64,3 +64,18 @@ test('sync deletions honor Obsidian file deletion preferences through the file m
 	await new LocalVaultAdapter(app).trash(file.path, '.obsidian');
 	assert.deepEqual(removed, [file]);
 });
+
+test('scan excludes indexed Quark downloads but retains ordinary attachments beside them', async () => {
+	const managed = { path: 'Quark Downloads/photo.png', stat: { size: 1 }, extension: 'png' };
+	const ordinary = { path: 'Quark Downloads/notes.txt', stat: { size: 1 }, extension: 'txt' };
+	const app = asApp({
+		getFiles: () => [managed, ordinary],
+		readBinary: async (file: typeof managed | typeof ordinary) => {
+			if (file === managed) throw new Error('managed download should not be read for sync');
+			return Uint8Array.of(7).buffer;
+		},
+	});
+	const scan = await new LocalVaultAdapter(app).scan('.obsidian', new Set([managed.path]));
+	assert.deepEqual(scan.files.map((file) => file.path), [ordinary.path]);
+	assert.deepEqual(scan.presentPaths, [ordinary.path]);
+});

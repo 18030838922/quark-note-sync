@@ -165,3 +165,22 @@ test('prototype-shaped vault names remain ordinary snapshot keys', async () => {
 	assert.equal(plan.nextSnapshots[constructorPath].hash, 'constructor-hash');
 	assert.equal(plan.nextSnapshots[stringPath].hash, 'string-hash');
 });
+
+test('indexed Quark downloads are excluded while ordinary files in the same folder stay syncable', async () => {
+	const downloaded: VersionEvent = { ...base, id: 'download', path: 'Quark Downloads/photo.png', sha256: 'download-hash' };
+	const ordinary: VersionEvent = { ...base, id: 'ordinary', path: 'Quark Downloads/my-attachment.txt', sha256: 'ordinary-hash' };
+	const plan = await buildSyncPlan({
+		localFiles: [local(downloaded.path, 'download-hash', 10), local(ordinary.path, 'ordinary-hash', 10)],
+		presentPaths: [downloaded.path, ordinary.path],
+		snapshots: {
+			[downloaded.path]: { hash: 'download-hash', heads: ['download'] },
+		},
+		remoteEvents: [downloaded, ordinary],
+		managedPaths: [downloaded.path],
+		deviceId: 'pc',
+		now: 100,
+	});
+	assert.deepEqual(plan.events, []);
+	assert.deepEqual(plan.paths.map((path) => path.path), [ordinary.path]);
+	assert.equal(Object.prototype.hasOwnProperty.call(plan.nextSnapshots, downloaded.path), false);
+});

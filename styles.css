@@ -776,3 +776,163 @@
 		padding: 8px 10px;
 	}
 }
+
+.quark-login-qr img {
+	display: block;
+	width: min(260px, 100%);
+	height: auto;
+	margin-inline: auto;
+}
+
+.quark-browser-view-content,
+.quark-preview-content {
+	box-sizing: border-box;
+	height: 100%;
+	overflow: auto;
+	padding: 18px 22px 28px;
+}
+
+.quark-browser-title,
+.quark-preview-title {
+	color: var(--text-normal);
+	font-size: var(--h2-size, 1.35em);
+	font-weight: var(--h2-weight, 600);
+	margin: 0 0 14px;
+}
+
+.quark-browser-toolbar,
+.quark-browser-share-input {
+	align-items: center;
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	margin-bottom: 12px;
+}
+
+.quark-browser-share-input input {
+	flex: 1 1 260px;
+	min-width: 0;
+}
+
+.quark-browser-breadcrumb,
+.quark-browser-readonly-note,
+.quark-browser-size {
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller, 0.85em);
+}
+
+.quark-browser-list {
+	border-top: 1px solid var(--background-modifier-border);
+	margin-top: 12px;
+}
+
+.quark-browser-entry {
+	align-items: center;
+	border-bottom: 1px solid var(--background-modifier-border);
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	min-width: 0;
+	padding: 9px 0;
+}
+
+.quark-browser-entry-name {
+	background: transparent;
+	border: 0;
+	color: var(--text-normal);
+	cursor: pointer;
+	flex: 1 1 220px;
+	font: inherit;
+	min-width: 0;
+	overflow-wrap: anywhere;
+	padding: 2px 0;
+	text-align: start;
+}
+
+.quark-browser-entry-name:hover {
+	color: var(--text-accent);
+	text-decoration: underline;
+}
+
+.quark-browser-size {
+	font-variant-numeric: tabular-nums;
+	margin-inline-start: auto;
+}
+
+.quark-browser-error {
+	color: var(--text-error);
+}
+
+.quark-preview-image,
+.quark-inline-media-image {
+	display: block;
+	height: auto;
+	margin: 12px auto;
+	max-height: min(78vh, 1000px);
+	max-width: 100%;
+	object-fit: contain;
+}
+
+.quark-preview-audio,
+.quark-preview-video,
+.quark-inline-media-audio,
+.quark-inline-media-video {
+	display: block;
+	max-width: 100%;
+	width: min(100%, 860px);
+}
+
+.quark-preview-pdf {
+	border: 0;
+	display: block;
+	height: min(78vh, 1100px);
+	margin-top: 12px;
+	width: 100%;
+}
+
+.quark-preview-text {
+	background: var(--background-secondary);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-m);
+	margin: 10px 0;
+	max-height: 78vh;
+	overflow: auto;
+	padding: 14px;
+	white-space: pre-wrap;
+	word-break: break-word;
+}
+
+.quark-live-reference {
+	align-items: center;
+	display: inline-flex;
+	max-width: 100%;
+	vertical-align: baseline;
+}
+
+.quark-live-reference-button,
+.quark-inline-load-button {
+	background: var(--background-modifier-hover);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-s);
+	color: var(--text-accent);
+	cursor: pointer;
+	font: inherit;
+	max-width: 100%;
+	overflow-wrap: anywhere;
+	padding: 2px 7px;
+}
+
+.quark-live-reference-button:hover,
+.quark-inline-load-button:hover {
+	background: var(--background-modifier-active-hover);
+}
+
+.quark-inline-media-image {
+	border-radius: var(--radius-s);
+	margin-block: 0.8em;
+}
+
+.quark-inline-media-audio,
+.quark-inline-media-video {
+	margin-block: 0.8em;
+}

@@ -72,6 +72,22 @@ test('directory listing follows all declared pages before returning files', asyn
 	assert.equal(new URL(transport.requests[1].url).searchParams.get('_page'), '2');
 });
 
+test('personal references resolve moved files through the authenticated file ID metadata endpoint', async () => {
+	const transport = new FixtureTransport((request) => {
+		const url = new URL(request.url);
+		assert.equal(request.method, 'POST');
+		assert.equal(url.pathname, '/1/clouddrive/file/v2/info/list');
+		assert.equal(request.cookie, 'sid=secret');
+		assert.deepEqual(JSON.parse(String(request.body)), {
+			fids: ['file_123'], fetch_pdir_name: 1, filter_secret_check_fail: 1,
+		});
+		return response({ code: 0, data: [{ fid: 'file_123', file_name: 'moved/photo.png', file_type: 1, dir: false, size: 42 }] });
+	});
+	assert.deepEqual(await new QuarkClient(transport, 'sid=secret').getFileById('file_123'), {
+		fid: 'file_123', name: 'moved/photo.png', isDirectory: false, size: 42,
+	});
+});
+
 test('missing or short pagination metadata stops the listing as incomplete', async () => {
 	const missingTotal = new FixtureTransport(() => response({ code: 0, data: { list: [] } }));
 	await assert.rejects(() => new QuarkClient(missingTotal, 'sid=x').listDirectory('parent'), /分页/);
@@ -303,6 +319,21 @@ test('download refuses a URL returned for a different file and uses the approved
 	const downloadRequest = correct.requests.find((request) => request.purpose === 'download')!;
 	assert.equal(downloadRequest.cookie, 'sid=secret');
 	assert.equal(downloadRequest.headers?.Referer, 'https://pan.quark.cn/');
+});
+
+test('bounded personal preview passes its cap to the transport and rejects oversized metadata before network I/O', async () => {
+	const file = { fid: 'f1', name: 'photo.png', isDirectory: false, size: 2 };
+	const transport = new FixtureTransport((request) => {
+		if (request.purpose === 'download') {
+			return { status: 200, headers: {}, url: request.url, data: Uint8Array.of(1, 2), text: () => '' };
+		}
+		return response({ code: 0, data: [{ fid: 'f1', download_url: 'https://bucket.pds.quark.cn/object' }] });
+	});
+	assert.deepEqual([...await new QuarkClient(transport, 'sid=x').downloadFile(file, 2)], [1, 2]);
+	assert.equal(transport.requests.find((request) => request.purpose === 'download')?.maxResponseBytes, 2);
+	const oversized = new FixtureTransport(() => { throw new Error('must not request'); });
+	await assert.rejects(() => new QuarkClient(oversized, 'sid=x').downloadFile({ ...file, size: 3 }, 2), /上限/);
+	assert.equal(oversized.requests.length, 0);
 });
 
 

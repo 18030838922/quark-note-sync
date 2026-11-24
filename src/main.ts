@@ -6,7 +6,13 @@ import {
 	Plugin,
 	PluginSettingTab,
 	Setting,
+	MarkdownView,
+	MarkdownRenderChild,
+	Menu,
 	type App,
+	type Editor,
+	type MarkdownFileInfo,
+	type TAbstractFile,
 	type TextComponent,
 	type WorkspaceLeaf,
 } from 'obsidian';
@@ -14,13 +20,29 @@ import QRCode from 'qrcode';
 import type { PendingApplyState, SyncSummary } from './sync-service.ts';
 import { QuarkSyncService } from './sync-service.ts';
 import type { SyncPlan, SyncSnapshot } from './sync-engine.ts';
-import { QuarkAuthenticationError, QuarkClient } from './quark-api.ts';
+import { QuarkAuthenticationError, QuarkClient, type RemoteFile } from './quark-api.ts';
 import { QuarkTransport, type HttpRequest, type HttpResponse } from './transport.ts';
 import { QuarkQrLogin, type QuarkQrSession } from './quark-login.ts';
 import { createPairingCode, readPairingCode } from './pairing-code.ts';
 import { settingsText, type Language } from './settings-text.ts';
 import { DASHBOARD_VIEW_TYPE, QuarkDashboardSidebar, type QuarkDashboardActions, type QuarkDashboardView } from './dashboard.ts';
 import { summarizeVaultFiles } from './dashboard-stats.ts';
+import { addSourceIndexEntry, chooseDownloadPath, managedDownloadPaths, moveSourceIndexPath, normalizeSourceIndex, QUARK_DOWNLOADS_DIRECTORY, sourceIndexKey, type SourceIndex, type SourceIndexEntry } from './source-index.ts';
+import { accountReferenceKey, findOfficialShareUrl, formatPersonalReference, formatPublicShareReference, MAX_PERSONAL_DOWNLOAD_BYTES, mimeTypeForFile, parseOfficialShareUrl, parsePersonalReference, previewKindForFile, type PreviewKind } from './quark-references.ts';
+import {
+	QUARK_BROWSER_VIEW_TYPE,
+	QUARK_PREVIEW_VIEW_TYPE,
+	QuarkBrowserView,
+	QuarkPreviewView,
+	type PreviewPayload,
+	type QuarkBrowserActions,
+	type ShareEntryLike,
+	type ShareSessionLike,
+	type SourceEditorTarget,
+} from './source-browser.ts';
+import { QuarkShareClient } from './share-api.ts';
+import { sha256Hex } from './hash.ts';
+import { createReferenceLivePreview } from './live-preview.ts';
 
 const PLUGIN_ID = 'quark-note-sync';
 const DEFAULT_CLOUD_DIRECTORY = 'Obsidian Notes';
@@ -42,6 +64,7 @@ interface PluginSettings {
 	boundRootFid: string | null;
 	snapshots: Record<string, SyncSnapshot>;
 	pendingApplies: Record<string, PendingApplyState>;
+	sourceIndex: SourceIndex;
 }
 
 type PersistedData = Partial<PluginSettings>;
@@ -72,6 +95,7 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 	private layoutReady = false;
 	private accountNickname: string | undefined;
 	private settingsTab!: QuarkSettingsTab;
+	private loginModal: QuarkLoginModal | undefined;
 	private dashboard: QuarkDashboardSidebar | undefined;
 	private dashboardLeafPending: Promise<WorkspaceLeaf> | undefined;
 	private dashboardOpening: Promise<void> | undefined;
@@ -90,8 +114,97 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 
 		const dashboardName = this.config.language === 'en' ? 'Open sync dashboard' : '打开同步面板';
 		this.registerView(DASHBOARD_VIEW_TYPE, (leaf) => this.createDashboardView(leaf));
+		this.registerView(QUARK_BROWSER_VIEW_TYPE, (leaf) => new QuarkBrowserView(leaf, this.browserActions()));
+		this.registerView(QUARK_PREVIEW_VIEW_TYPE, (leaf) => new QuarkPreviewView(leaf, () => this.config.language));
+		this.registerEditorExtension(createReferenceLivePreview({
+			language: () => this.config.language,
+			openReference: async (reference, showMedia) => await this.openPersonalReference({
+				account: reference.accountKey,
+				fid: reference.fid,
+			}, showMedia),
+			openShare: async (rawUrl, showMedia) => await this.openPublicShare(rawUrl, showMedia, this.captureActiveEditorTarget()),
+			reportError: (error) => new Notice(error instanceof Error ? error.message : this.config.language === 'en' ? 'Could not open the Quark file.' : '无法打开夸克文件。'),
+		}));
 		this.addRibbonIcon('cloud', dashboardName, () => void this.openDashboard());
 		this.addCommand({ id: 'open-dashboard', name: dashboardName, callback: () => void this.openDashboard() });
+		this.addCommand({
+			id: 'browse-quark-drive',
+			name: this.config.language === 'en' ? 'Browse Quark Drive' : '浏览夸克网盘',
+			callback: () => void this.openBrowser(),
+		});
+		this.addCommand({
+			id: 'insert-quark-reference',
+			name: this.config.language === 'en' ? 'Insert Quark Drive file' : '插入夸克网盘文件',
+			callback: () => void this.openBrowser(this.captureActiveEditorTarget()),
+		});
+		this.registerEvent(this.app.workspace.on('editor-menu', (menu, editor, info) => {
+			this.addEditorMenuItems(menu, editor, info);
+		}));
+		this.registerMarkdownPostProcessor((element, context) => {
+			const inlineMedia = new QuarkInlineMediaChild(element);
+			context.addChild(inlineMedia);
+			for (const anchor of Array.from(element.querySelectorAll<HTMLAnchorElement>('a[href]'))) {
+				const rawUrl = anchor.href;
+				if (anchor.dataset.quarkShareHandler !== '1') {
+					if (parseOfficialShareUrl(rawUrl)) {
+						anchor.dataset.quarkShareHandler = '1';
+						anchor.title = this.config.language === 'en'
+							? 'Open read-only Quark share browser'
+							: '在只读视图中打开夸克分享';
+						inlineMedia.onClick(anchor, (event) => {
+							event.preventDefault();
+							event.stopPropagation();
+							void this.openPublicShare(rawUrl, (payload) => {
+								if (!anchor.isConnected) return;
+								const media = createInlineMedia(payload, inlineMedia);
+								if (media) anchor.after(media);
+							});
+						});
+						continue;
+					}
+					const reference = parsePersonalReference(rawUrl);
+					if (!reference) continue;
+					anchor.dataset.quarkShareHandler = '1';
+					anchor.title = this.config.language === 'en'
+						? 'Open Quark file; images and audio/video load inline on demand'
+						: '打开夸克文件；图片和音视频会按需内嵌加载';
+					inlineMedia.onClick(anchor, (event) => {
+						event.preventDefault();
+						event.stopPropagation();
+						void this.openPersonalReference({ account: reference.accountKey, fid: reference.fid }, (payload) => {
+							const media = createInlineMedia(payload, inlineMedia);
+						if (media && anchor.isConnected) anchor.after(media);
+						});
+					});
+				}
+			}
+			for (const image of Array.from(element.querySelectorAll<HTMLImageElement>('img[src]'))) {
+				const reference = parsePersonalReference(image.getAttribute('src') ?? image.src);
+				if (!reference || image.dataset.quarkShareHandler === '1') continue;
+				image.dataset.quarkShareHandler = '1';
+				const button = document.createElement('button');
+				button.type = 'button';
+				button.className = 'quark-inline-load-button';
+				button.textContent = this.config.language === 'en' ? `Load ${image.alt || 'Quark image'}` : `加载${image.alt || '夸克图片'}`;
+				button.setAttribute('aria-label', button.textContent);
+				image.replaceWith(button);
+				inlineMedia.onClick(button, (event) => {
+					event.preventDefault();
+					button.disabled = true;
+					void this.openPersonalReference({ account: reference.accountKey, fid: reference.fid }, (payload) => {
+						const media = createInlineMedia(payload, inlineMedia);
+						if (media && button.isConnected) button.replaceWith(media);
+					}).then(() => {
+						if (button.isConnected) button.disabled = false;
+					}).catch((error: unknown) => {
+						if (button.isConnected) button.disabled = false;
+						new Notice(error instanceof Error ? error.message : this.config.language === 'en' ? 'Could not load the Quark image.' : '无法加载夸克图片。');
+					});
+				});
+			}
+		});
+		this.registerObsidianProtocolHandler('quark-note', (params) => void this.openPersonalReference(params));
+		this.registerEvent(this.app.vault.on('rename', (file, oldPath) => this.updateSourceIndexPath(file, oldPath)));
 
 		this.addCommand({
 			id: 'preview-sync',
@@ -112,7 +225,7 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 			id: 'quark-qr-login',
 			name: '夸克扫码登录',
 			checkCallback: (checking) => {
-				if (Platform.isMobileApp || this.accountView.state === 'connected' || this.busy) return false;
+				if (this.accountView.state === 'connected' || this.busy || this.unloading) return false;
 				if (!checking) this.openQrLogin();
 				return true;
 			},
@@ -138,6 +251,13 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 
 	onunload(): void {
 		this.unloading = true;
+		this.loginModal?.close();
+		for (const leaf of this.app.workspace.getLeavesOfType(QUARK_BROWSER_VIEW_TYPE)) {
+			if (leaf.view instanceof QuarkBrowserView) leaf.view.clearSensitiveState();
+		}
+		for (const leaf of this.app.workspace.getLeavesOfType(QUARK_PREVIEW_VIEW_TYPE)) {
+			if (leaf.view instanceof QuarkPreviewView) leaf.view.clear();
+		}
 		this.dashboard = undefined;
 		this.dashboardPreview = undefined;
 		this.dashboardRequest += 1;
@@ -145,6 +265,407 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 			window.clearInterval(this.autoSyncTimer);
 			this.autoSyncTimer = undefined;
 		}
+	}
+
+	private async openBrowser(target?: SourceEditorTarget, mode: 'personal' | 'share' = 'personal'): Promise<QuarkBrowserView | undefined> {
+		if (this.unloading) return undefined;
+		try {
+			const leaf = this.app.workspace.getLeaf('tab');
+			await leaf.setViewState({ type: QUARK_BROWSER_VIEW_TYPE, state: { mode }, active: true });
+			await leaf.loadIfDeferred();
+			const view = leaf.view as QuarkBrowserView;
+			view.setInsertionTarget(target);
+			return view;
+		} catch {
+			new Notice(this.config.language === 'en' ? 'Could not open the Quark browser tab.' : '无法打开夸克浏览页签。');
+			return undefined;
+		}
+	}
+
+	private async openPublicShare(
+		rawUrl: string,
+		showInlineMedia?: (payload: PreviewPayload) => void,
+		target?: SourceEditorTarget,
+	): Promise<void> {
+		const share = parseOfficialShareUrl(rawUrl);
+		if (!share || this.unloading) return;
+		if (share.selectedFid) {
+			const shareKey = await sha256Hex(new TextEncoder().encode(`quark-public-share-reference:${share.pwdId}`));
+			const cached = this.findIndexedSource(shareKey, share.selectedFid);
+			if (cached && await this.previewCachedSource(cached, showInlineMedia)) return;
+		}
+		if (showInlineMedia) {
+			try {
+				const client = this.createShareClient();
+				const session = await client.openShare(share.pwdId, share.passcode);
+				const entries = await client.listDirectory(session, share.selectedParentFid ?? '0');
+				const file = share.selectedFid
+					? entries.find((entry) => entry.fid === share.selectedFid)
+					: entries.length === 1 ? entries[0] : undefined;
+				if (file && !file.isDirectory && previewKindForFile(file.name).kind === 'image') {
+					const payload = await client.previewDocumentOrImage(session, file);
+					if (!this.unloading) showInlineMedia(createPreviewPayload(file.name, 'image', payload.bytes, payload.mimeType));
+					return;
+				}
+			} catch {
+				// The share tab handles passcodes, expired links, and provider restrictions.
+			}
+		}
+		const view = await this.openBrowser(target, 'share');
+		if (view && !this.unloading) await view.openShareUrl(rawUrl);
+	}
+
+	private addEditorMenuItems(menu: Menu, editor: Editor, info: MarkdownFileInfo): void {
+		const target = this.captureEditorTarget(editor, info);
+		menu.addItem((item) => item
+			.setTitle(this.config.language === 'en' ? 'Insert Quark Drive file' : '插入夸克网盘文件')
+			.setIcon('cloud')
+			.onClick(() => void this.openBrowser(target)));
+		const selection = editor.getSelection();
+		const currentLine = editor.getLine(editor.getCursor().line);
+		const shareUrl = findOfficialShareUrl(selection) ?? findOfficialShareUrl(currentLine);
+		if (shareUrl) {
+			menu.addItem((item) => item
+				.setTitle(this.config.language === 'en' ? 'Open public Quark share (read only)' : '只读打开夸克公开分享')
+				.setIcon('external-link')
+				.onClick(() => void this.openPublicShare(shareUrl, undefined, target)));
+		}
+	}
+
+	private captureActiveEditorTarget(): SourceEditorTarget | undefined {
+		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+		return view ? this.captureEditorTarget(view.editor, view) : undefined;
+	}
+
+	private captureEditorTarget(editor: Editor, info?: MarkdownFileInfo): SourceEditorTarget | undefined {
+		const active = this.app.workspace.getActiveViewOfType(MarkdownView);
+		const sourceView = info?.editor === editor ? info as MarkdownView : active;
+		const path = info?.file?.path ?? sourceView?.file?.path;
+		if (!sourceView || !path || sourceView.file?.path !== path) return undefined;
+		const originalText = editor.getValue();
+		const anchor = editor.getCursor('from');
+		const head = editor.getCursor('to');
+		return {
+			insert: (markdown) => {
+				if (sourceView.file?.path !== path || editor.getValue() !== originalText) return false;
+				editor.setSelection(anchor, head);
+				editor.replaceSelection(markdown);
+				editor.focus();
+				return true;
+			},
+		};
+	}
+
+	private browserActions(): QuarkBrowserActions {
+		return {
+			language: this.config.language,
+			listPersonal: async (parentFid) => await this.createClient(this.requireCookie()).listDirectory(parentFid),
+			openShare: async (pwdId, passcode) => await this.createShareClient().openShare(pwdId, passcode),
+			listShare: async (session, parentFid) => await this.createShareClient().listDirectory(session, parentFid),
+			previewPersonal: async (file, parentFid, target) => await this.previewPersonalFile(file, parentFid, target),
+			downloadPersonal: async (file, _parentFid, target) => await this.downloadPersonalFile(file, target),
+			insertReference: async (file, _parentFid, target) => this.insertPersonalReference(file, target),
+			insertShareReference: async (session, file, parentFid, target) => this.insertShareReference(session, file, parentFid, target),
+			previewShare: async (session, file, officialUrl) => await this.previewShareFile(session, file, officialUrl),
+			downloadShare: async (session, file, parentFid, target) => await this.downloadShareFile(session, file, parentFid, target),
+			openOfficialShare: (url) => { window.open(url, '_blank', 'noopener'); },
+		};
+	}
+
+	private async previewPersonalFile(file: RemoteFile, _parentFid: string, target?: SourceEditorTarget): Promise<void> {
+		const preview = previewKindForFile(file.name);
+		if (preview.kind === 'unsupported' || file.size > preview.maxBytes) {
+			await this.openPreviewTab({
+				name: file.name,
+				kind: 'unsupported',
+				message: preview.kind === 'unsupported'
+					? this.config.language === 'en' ? 'This file type has no safe inline preview.' : '此文件类型没有安全的内嵌预览。'
+					: this.config.language === 'en' ? 'This file exceeds the preview size limit.' : '文件超过预览大小上限。',
+				download: async () => await this.downloadPersonalFile(file, target),
+			});
+			return;
+		}
+		await this.runExclusive(this.config.language === 'en' ? 'Preview Quark file' : '预览夸克文件', async () => {
+			const client = this.createClient(this.requireCookie());
+			const bytes = await client.downloadFile(file, preview.maxBytes);
+			await this.openPreviewTab(createPreviewPayload(file.name, preview.kind, bytes, mimeTypeForFile(file.name)));
+		}, true);
+	}
+
+	private async previewShareFile(session: ShareSessionLike, file: ShareEntryLike, officialUrl: string): Promise<void> {
+		if (previewKindForFile(file.name).kind === 'image' || /\.pdf$/i.test(file.name)) {
+			try {
+				const result = await this.createShareClient().previewDocumentOrImage(session, file);
+				const kind: PreviewKind = result.mimeType === 'application/pdf' ? 'document' : 'image';
+				await this.openPreviewTab(createPreviewPayload(file.name, kind, result.bytes, result.mimeType, undefined, officialUrl));
+				return;
+			} catch {
+				// Use the original share link when Quark restricts the preview.
+			}
+		}
+		await this.openPreviewTab({
+			name: file.name,
+			kind: 'unsupported',
+			message: this.config.language === 'en' ? 'Preview unavailable for this share.' : '预览暂不可用。',
+			officialUrl,
+		});
+	}
+
+	private async downloadPersonalFile(file: RemoteFile, target?: SourceEditorTarget): Promise<void> {
+		const result = await this.runExclusive(this.config.language === 'en' ? 'Download Quark file' : '下载夸克文件', async () => {
+			if (file.size > MAX_PERSONAL_DOWNLOAD_BYTES) throw new Error(this.config.language === 'en'
+				? 'This file exceeds the 100 MiB download limit.'
+				: '此文件超过 100 MiB 下载上限。');
+			const client = this.createClient(this.requireCookie());
+			const accountId = await client.checkConnection();
+			if (!accountId) throw new Error('夸克未返回稳定账号编号');
+			if (this.config.boundAccountId && accountId !== this.config.boundAccountId) {
+				throw new Error('当前夸克账号与此笔记库绑定的账号不一致');
+			}
+			const accountKey = await accountReferenceKey(accountId);
+			const bytes = await client.downloadFile(file, MAX_PERSONAL_DOWNLOAD_BYTES);
+			const path = await this.saveQuarkDownload(file.name, bytes, { accountKey, fid: file.fid });
+			return { path, accountKey };
+		}, true);
+		if (!result) return;
+		if (target && !target.insert(formatPersonalReference(file.name, result.accountKey, file.fid))) {
+			new Notice(this.config.language === 'en'
+				? `Saved ${result.path}, but the source note changed, so the link was not inserted.`
+				: `已保存到 ${result.path}；来源笔记已变化，因此没有插入链接。`);
+			return;
+		}
+		new Notice(this.config.language === 'en' ? `Saved to ${result.path}` : `已下载到 ${result.path}`);
+	}
+
+	private async downloadShareFile(
+		session: ShareSessionLike,
+		file: ShareEntryLike,
+		parentFid: string,
+		target?: SourceEditorTarget,
+	): Promise<void> {
+		const result = await this.runExclusive(this.config.language === 'en' ? 'Download public share PDF' : '下载公开分享 PDF', async () => {
+			const shareKey = await sha256Hex(new TextEncoder().encode(`quark-public-share-reference:${session.pwdId}`));
+			const bytes = await this.createShareClient().downloadFile(session, file, 20 * 1024 * 1024);
+			const path = await this.saveQuarkDownload(file.name, bytes.bytes, { accountKey: shareKey, fid: file.fid });
+			return path;
+		});
+		if (!result) return;
+		if (target && !target.insert(formatPublicShareReference(file.name, session.pwdId, file.fid, parentFid))) {
+			new Notice(this.config.language === 'en'
+				? `Saved ${result}, but the source note changed, so the link was not inserted.`
+				: `已保存到 ${result}；来源笔记已变化，因此没有插入链接。`);
+			return;
+		}
+		new Notice(this.config.language === 'en' ? `Saved to ${result}` : `已下载到 ${result}`);
+	}
+
+	private async insertPersonalReference(file: RemoteFile, target?: SourceEditorTarget): Promise<void> {
+		const accountId = this.config.boundAccountId;
+		if (!target) {
+			new Notice(this.config.language === 'en' ? 'Open a Markdown note before inserting a link.' : '请先打开 Markdown 笔记，再插入链接。');
+			return;
+		}
+		if (!accountId) {
+			new Notice(this.config.language === 'en' ? 'The Quark account ID is not available.' : '当前没有可用的夸克账号编号。');
+			return;
+		}
+		const inserted = target.insert(formatPersonalReference(file.name, await accountReferenceKey(accountId), file.fid));
+		if (!inserted) new Notice(this.config.language === 'en'
+			? 'The source note changed, so the link was not inserted.'
+			: '来源笔记已变化，因此没有插入链接。');
+	}
+
+	private async insertShareReference(
+		session: ShareSessionLike,
+		file: ShareEntryLike,
+		parentFid: string,
+		target?: SourceEditorTarget,
+	): Promise<void> {
+		if (!target) {
+			new Notice(this.config.language === 'en' ? 'Open a Markdown note before inserting a link.' : '请先打开 Markdown 笔记，再插入链接。');
+			return;
+		}
+		const inserted = target.insert(formatPublicShareReference(file.name, session.pwdId, file.fid, parentFid));
+		if (!inserted) new Notice(this.config.language === 'en'
+			? 'The source note changed, so the link was not inserted.'
+			: '来源笔记已变化，因此没有插入链接。');
+	}
+
+	private async saveQuarkDownload(name: string, bytes: Uint8Array, source: { accountKey: string; fid: string }): Promise<string> {
+		await this.ensureQuarkDownloadsFolder();
+		const paths = new Set<string>([
+			...this.app.vault.getFiles().map((file) => file.path),
+			...Object.keys(this.config.snapshots),
+			...Object.keys(this.config.pendingApplies),
+			...managedDownloadPaths(this.config.sourceIndex),
+		]);
+		let path = chooseDownloadPath(name, paths);
+		for (let attempt = 0; attempt < 100; attempt += 1) {
+			if (!(await this.app.vault.adapter.exists(path))) break;
+			paths.add(path);
+			path = chooseDownloadPath(name, paths);
+		}
+		if (await this.app.vault.adapter.exists(path)) throw new Error('夸克下载文件重名过多，无法安全保存');
+		const entry: SourceIndexEntry = {
+			...source,
+			name,
+			size: bytes.byteLength,
+			localPath: path,
+			sha256: await sha256Hex(bytes),
+			downloadedAt: Date.now(),
+		};
+		this.config.sourceIndex = addSourceIndexEntry(this.config.sourceIndex, entry);
+		await this.persistData();
+		await this.app.vault.createBinary(path, toArrayBuffer(bytes));
+		return path;
+	}
+
+	private async ensureQuarkDownloadsFolder(): Promise<void> {
+		const path = QUARK_DOWNLOADS_DIRECTORY;
+		if (await this.app.vault.adapter.exists(path)) {
+			const stat = await this.app.vault.adapter.stat(path);
+			if (stat?.type !== 'folder') throw new Error('Quark Downloads is occupied by a file; no file was overwritten');
+			return;
+		}
+		try {
+			await this.app.vault.createFolder(path);
+		} catch {
+			const stat = await this.app.vault.adapter.stat(path);
+			if (stat?.type !== 'folder') throw new Error('无法安全创建 Quark Downloads 文件夹');
+		}
+	}
+
+	private async openPreviewTab(payload: PreviewPayload): Promise<void> {
+		if (this.unloading) return;
+		const leaf = this.app.workspace.getLeaf('tab');
+		await leaf.setViewState({ type: QUARK_PREVIEW_VIEW_TYPE, active: true });
+		await leaf.loadIfDeferred();
+		const view = leaf.view as QuarkPreviewView;
+		view.show(payload);
+	}
+
+	private createShareClient(): QuarkShareClient {
+		const transport = this.createTransport();
+		return new QuarkShareClient({
+			request: async (request: HttpRequest): Promise<HttpResponse> => {
+				if (this.unloading) throw new Error('插件已卸载，已停止夸克分享请求');
+				return await transport.request(request);
+			},
+		});
+	}
+
+	private async openPersonalReference(
+		params: Record<string, string>,
+		showInlineMedia?: (payload: PreviewPayload) => void,
+	): Promise<void> {
+		if (Object.keys(params).some((key) => !['action', 'account', 'fid'].includes(key)) ||
+			(params.action !== undefined && params.action !== 'quark-note')) {
+			new Notice(this.config.language === 'en' ? 'This Quark reference is malformed.' : '夸克引用格式无效。');
+			return;
+		}
+		const link = new URL('obsidian://quark-note');
+		link.searchParams.set('account', params.account ?? '');
+		link.searchParams.set('fid', params.fid ?? '');
+		const reference = parsePersonalReference(link.toString());
+		if (!reference) {
+			new Notice(this.config.language === 'en' ? 'This Quark reference is malformed.' : '夸克引用格式无效。');
+			return;
+		}
+		const cached = this.findIndexedSource(reference.accountKey, reference.fid);
+		if (cached && await this.previewCachedSource(cached, showInlineMedia)) return;
+		const cookie = this.readCookie();
+		if (!cookie || this.config.sessionExpired) {
+			new Notice(this.config.language === 'en'
+				? 'Connect to Quark to open this reference. No local download is available offline.'
+				: '请连接夸克以打开此引用；当前没有可用的离线下载。');
+			return;
+		}
+		await this.runExclusive(this.config.language === 'en' ? 'Open Quark reference' : '打开夸克引用', async () => {
+			const client = this.createClient(cookie);
+			const accountId = await client.checkConnection();
+			const currentAccountKey = accountId ? await accountReferenceKey(accountId) : '';
+			if (currentAccountKey !== reference.accountKey) {
+				if (cached && await this.previewCachedSource(cached, showInlineMedia)) return true;
+				throw new Error('此引用属于另一个夸克账号');
+			}
+			try {
+				const file = await client.getFileById(reference.fid);
+				if (file.isDirectory) throw new Error('夸克引用指向的是文件夹，请从浏览器中打开');
+				await this.previewPersonalContent(client, file, cached, showInlineMedia);
+			} catch (error) {
+				if (cached && await this.previewCachedSource(cached, showInlineMedia)) return true;
+				throw error;
+			}
+			return true;
+		}, true);
+	}
+
+	private async previewPersonalContent(
+		client: QuarkClient,
+		file: RemoteFile,
+		cached?: SourceIndexEntry,
+		showInlineMedia?: (payload: PreviewPayload) => void,
+	): Promise<void> {
+		const preview = previewKindForFile(file.name);
+		if (preview.kind === 'unsupported' || file.size > preview.maxBytes) {
+			await this.openPreviewTab({
+				name: file.name,
+				kind: 'unsupported',
+				message: preview.kind === 'unsupported'
+					? this.config.language === 'en' ? 'This file type has no safe inline preview.' : '此文件类型没有安全的内嵌预览。'
+					: this.config.language === 'en' ? 'This file exceeds the preview size limit.' : '文件超过预览大小上限。',
+				download: async () => await this.downloadPersonalFile(file),
+			});
+			return;
+		}
+		try {
+			const bytes = await client.downloadFile(file, preview.maxBytes);
+			const payload = createPreviewPayload(file.name, preview.kind, bytes, mimeTypeForFile(file.name));
+			if (showInlineMedia && (preview.kind === 'image' || preview.kind === 'audio' || preview.kind === 'video')) showInlineMedia(payload);
+			else await this.openPreviewTab(payload);
+		} catch (error) {
+			if (cached && await this.previewCachedSource(cached, showInlineMedia)) return;
+			throw error;
+		}
+	}
+
+	private findIndexedSource(accountKey: string, fid: string): SourceIndexEntry | undefined {
+		return Object.values(this.config.sourceIndex)
+			.filter((entry) => entry.accountKey === accountKey && entry.fid === fid)
+			.sort((left, right) => right.downloadedAt - left.downloadedAt)[0];
+	}
+
+	private async previewCachedSource(source: SourceIndexEntry, showInlineMedia?: (payload: PreviewPayload) => void): Promise<boolean> {
+		try {
+			const file = this.app.vault.getFileByPath(source.localPath);
+			if (!file) return false;
+			const preview = previewKindForFile(source.name);
+			if (preview.kind === 'unsupported' || file.stat.size > preview.maxBytes) {
+				await this.openPreviewTab({
+					name: source.name,
+					kind: 'unsupported',
+					message: this.config.language === 'en'
+						? `Offline copy is available at ${source.localPath}, but it exceeds the inline preview limit or has an unsupported type.`
+						: `离线文件位于 ${source.localPath}，但超过内嵌预览上限或文件类型不受支持。`,
+				});
+				return true;
+			}
+			const bytes = new Uint8Array(await this.app.vault.readBinary(file));
+			if (bytes.byteLength > preview.maxBytes || await sha256Hex(bytes) !== source.sha256) return false;
+			const payload = createPreviewPayload(source.name, preview.kind, bytes, mimeTypeForFile(source.name));
+			if (showInlineMedia && (preview.kind === 'image' || preview.kind === 'audio' || preview.kind === 'video')) showInlineMedia(payload);
+			else await this.openPreviewTab(payload);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	private updateSourceIndexPath(_file: TAbstractFile, oldPath: string): void {
+		const next = moveSourceIndexPath(this.config.sourceIndex, oldPath, _file.path);
+		if (JSON.stringify(next) === JSON.stringify(this.config.sourceIndex)) return;
+		this.config.sourceIndex = next;
+		void this.persistData();
 	}
 
 	async openDashboard(): Promise<void> {
@@ -266,7 +787,7 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 				this.redrawDashboard();
 			},
 			settings: () => this.openPluginSettings(),
-			login: !mobile && state !== 'connected' ? () => this.openQrLogin() : undefined,
+			login: state !== 'connected' ? () => this.openQrLogin() : undefined,
 			exportPairing: !mobile && state === 'connected' ? () => new ExportPairingModal(this.app, this).open() : undefined,
 			importPairing: mobile && state !== 'connected' ? () => new ImportPairingModal(this.app, this).open() : undefined,
 			logout: state !== 'signed-out' ? () => this.signOut() : undefined,
@@ -391,10 +912,6 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 	}
 
 	openQrLogin(): void {
-		if (Platform.isMobileApp) {
-			new Notice('请在 Windows Obsidian 中使用扫码登录；手机可导入电脑授权码');
-			return;
-		}
 		if (this.accountView.state === 'connected') return;
 		if (this.busy || this.unloading) {
 			new Notice('同步或连接检查运行期间不能开始扫码登录');
@@ -405,12 +922,15 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 			await this.saveValidatedCredential(cookie, this.config.cloudDirectoryName, stillCurrent);
 			new Notice('夸克账号已连接，网页会话已安全保存到此设备');
 		}, () => {
+			this.loginModal = undefined;
 			this.busy = false;
+			if (this.unloading) return;
 			this.settingsTab.refreshAccount();
 			if (this.dashboard && this.accountView.state === 'connected') void this.refreshDashboard(false);
 			else this.redrawDashboard();
 			this.runStartupSync();
 		});
+		this.loginModal = modal;
 		modal.open();
 	}
 
@@ -803,6 +1323,7 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 			deviceId: this.config.deviceId,
 			snapshots: this.config.snapshots,
 			pendingApplies: this.config.pendingApplies,
+			sourceIndex: this.config.sourceIndex,
 			persist: async () => {
 				if (this.unloading) throw new Error('插件已卸载，已停止后续同步操作');
 				await this.persistData();
@@ -821,7 +1342,9 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 	}
 
 	private createTransport(): QuarkTransport {
-		return new QuarkTransport(Platform.isMobileApp || Platform.isAndroidApp);
+		if (Platform.isIosApp) return new QuarkTransport('ios');
+		if (Platform.isAndroidApp) return new QuarkTransport('android');
+		return new QuarkTransport(Platform.isMobileApp ? 'mobile' : 'desktop');
 	}
 
 	private requireCookie(): string {
@@ -931,6 +1454,7 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 			boundRootFid: this.config.boundRootFid,
 			snapshots: this.config.snapshots,
 			pendingApplies: this.config.pendingApplies,
+			sourceIndex: this.config.sourceIndex,
 		});
 	}
 }
@@ -1118,16 +1642,16 @@ class QuarkSettingsTab extends PluginSettingTab {
 			}
 		} else {
 			row.setDesc(account.state === 'expired' ? copy.expired : copy.signedOut);
-			if (Platform.isDesktopApp && !Platform.isMobileApp) {
+			if (Platform.isDesktopApp || Platform.isMobileApp) {
 				row.addButton((button) => button
 					.setButtonText(copy.qrSignIn)
 					.setCta()
 					.setDisabled(this.plugin.isBusy)
 					.onClick(() => this.plugin.openQrLogin()));
-			} else if (Platform.isMobileApp) {
+			}
+			if (Platform.isMobileApp) {
 				row.addButton((button) => button
 					.setButtonText(copy.importAuthorization)
-					.setCta()
 					.setDisabled(this.plugin.isBusy)
 					.onClick(() => new ImportPairingModal(this.app, this.plugin).open()));
 			}
@@ -1155,6 +1679,9 @@ class QuarkLoginModal extends Modal {
 	private polling = false;
 	private committing = false;
 	private closed = false;
+	private readonly pollWhenVisible = () => {
+		if (this.contentEl.ownerDocument.visibilityState === 'visible') void this.poll();
+	};
 
 	constructor(app: App, login: QuarkQrLogin, onAuthorized: (cookie: string, stillCurrent: () => boolean) => Promise<void>, onClosed: () => void) {
 		super(app);
@@ -1166,7 +1693,12 @@ class QuarkLoginModal extends Modal {
 	onOpen(): void {
 		this.setTitle('夸克网页扫码登录');
 		this.contentEl.empty();
-		this.contentEl.createEl('p', { text: '请使用自己的夸克 App 扫描下方二维码，并在手机中确认登录。插件只会读取夸克网页登录接口返回的会话 Cookie。' });
+		this.contentEl.createEl('p', {
+			text: Platform.isMobileApp
+				? '同一台手机登录时，先截取下方二维码，再到夸克 App 的「扫一扫」选择相册图片（如果有此入口）并确认。也可用另一台设备扫码。确认后回到 Obsidian，保留此登录窗口。'
+				: '请使用自己的夸克 App 扫描下方二维码，并在手机中确认登录。',
+		});
+		this.contentEl.ownerDocument.addEventListener('visibilitychange', this.pollWhenVisible);
 		this.qrEl = this.contentEl.createDiv({ cls: 'quark-login-qr' });
 		this.statusEl = this.contentEl.createEl('p', { text: '正在向夸克申请二维码…' });
 		const buttons = this.contentEl.createDiv({ cls: 'modal-button-container' });
@@ -1179,10 +1711,12 @@ class QuarkLoginModal extends Modal {
 	}
 
 	onClose(): void {
+		if (this.closed) return;
 		this.closed = true;
+		this.contentEl.ownerDocument.removeEventListener('visibilitychange', this.pollWhenVisible);
 		this.stopPolling();
 		this.qrEl?.empty();
-		this.onClosed();
+		if (!this.committing) this.onClosed();
 	}
 
 	private async refreshQr(): Promise<void> {
@@ -1197,7 +1731,7 @@ class QuarkLoginModal extends Modal {
 			const session = await this.login.createSession();
 			if (this.closed || currentGeneration !== this.generation) return;
 			const image = this.qrEl.createEl('img', { attr: { alt: '夸克网页登录二维码', width: '260', height: '260' } });
-			image.src = await QRCode.toDataURL(session.qrUrl, { width: 260, margin: 1, errorCorrectionLevel: 'M' });
+			image.src = await QRCode.toDataURL(session.qrUrl, { width: 260, margin: 4, errorCorrectionLevel: 'M' });
 			if (this.closed || currentGeneration !== this.generation) return;
 			this.session = session;
 			this.statusEl.setText('等待手机扫码并确认登录…二维码约 5 分钟后过期。');
@@ -1251,6 +1785,10 @@ class QuarkLoginModal extends Modal {
 			}
 		} finally {
 			this.polling = false;
+			if (this.closed && this.committing) {
+				this.committing = false;
+				this.onClosed();
+			}
 		}
 	}
 
@@ -1464,6 +2002,37 @@ function appendList(container: HTMLElement, title: string, items: string[]): voi
 	if (items.length > 120) list.createEl('li', { text: `另有 ${items.length - 120} 项未显示` });
 }
 
+function createPreviewPayload(
+	name: string,
+	kind: PreviewKind,
+	bytes: Uint8Array,
+	mimeType: string,
+	download?: () => Promise<void>,
+	officialUrl?: string,
+): PreviewPayload {
+	if (kind === 'document' && mimeType !== 'application/pdf') {
+		return {
+			name,
+			kind,
+			text: new TextDecoder('utf-8', { fatal: false }).decode(bytes),
+			...(download ? { download } : {}),
+			...(officialUrl ? { officialUrl } : {}),
+		};
+	}
+	return {
+		name,
+		kind,
+		bytes,
+		mimeType,
+		...(download ? { download } : {}),
+		...(officialUrl ? { officialUrl } : {}),
+	};
+}
+
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+	return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
 function normalizeSettings(data: PersistedData): PluginSettings {
 	const deviceId = typeof data.deviceId === 'string' && /^[a-z0-9-]{1,80}$/i.test(data.deviceId)
 		? data.deviceId.toLowerCase()
@@ -1473,7 +2042,7 @@ function normalizeSettings(data: PersistedData): PluginSettings {
 		: DEFAULT_CLOUD_DIRECTORY;
 	const deviceName = typeof data.deviceName === 'string' && data.deviceName.trim() && data.deviceName.length <= 50
 		? data.deviceName.trim()
-		: (Platform.isAndroidApp ? 'Android' : 'Windows PC');
+		: (Platform.isIosApp ? 'iOS' : Platform.isAndroidApp ? 'Android' : 'Windows PC');
 	const interval = typeof data.autoSyncIntervalMinutes === 'number' && Number.isFinite(data.autoSyncIntervalMinutes)
 		? Math.min(1440, Math.max(1, Math.floor(data.autoSyncIntervalMinutes)))
 		: DEFAULT_AUTO_SYNC_MINUTES;
@@ -1496,6 +2065,7 @@ function normalizeSettings(data: PersistedData): PluginSettings {
 			? data.boundRootFid : null,
 		snapshots: normalizeSnapshots(data.snapshots),
 		pendingApplies: normalizePendingApplies(data.pendingApplies),
+		sourceIndex: normalizeSourceIndex(data.sourceIndex),
 	};
 }
 
@@ -1615,4 +2185,45 @@ function createDeviceId(): string {
 	bytes[8] = (bytes[8] & 0x3f) | 0x80;
 	const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
 	return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+class QuarkInlineMediaChild extends MarkdownRenderChild {
+	private readonly objectUrls = new Set<string>();
+	private readonly listeners: Array<() => void> = [];
+
+	trackObjectUrl(url: string): void {
+		this.objectUrls.add(url);
+	}
+
+	onClick(element: HTMLElement, callback: (event: MouseEvent) => void): void {
+		element.addEventListener('click', callback);
+		this.listeners.push(() => element.removeEventListener('click', callback));
+	}
+
+	onunload(): void {
+		for (const removeListener of this.listeners) removeListener();
+		this.listeners.length = 0;
+		for (const url of this.objectUrls) URL.revokeObjectURL(url);
+		this.objectUrls.clear();
+	}
+}
+
+function createInlineMedia(payload: PreviewPayload, owner: QuarkInlineMediaChild): HTMLElement | undefined {
+	if (!payload.bytes || !payload.mimeType || !['image', 'audio', 'video'].includes(payload.kind)) return undefined;
+	const buffer = payload.bytes.buffer.slice(payload.bytes.byteOffset, payload.bytes.byteOffset + payload.bytes.byteLength) as ArrayBuffer;
+	const url = URL.createObjectURL(new Blob([buffer], { type: payload.mimeType }));
+	owner.trackObjectUrl(url);
+	if (payload.kind === 'image') {
+		const image = owner.containerEl.ownerDocument.createElement('img');
+		image.className = 'quark-inline-media-image';
+		image.alt = payload.name;
+		image.src = url;
+		return image;
+	}
+	const media = owner.containerEl.ownerDocument.createElement(payload.kind) as HTMLAudioElement | HTMLVideoElement;
+	media.className = `quark-inline-media-${payload.kind}`;
+	media.controls = true;
+	media.preload = 'none';
+	media.src = url;
+	return media;
 }

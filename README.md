@@ -2,16 +2,16 @@
 
 # Quark Note Sync
 
-Sync Obsidian notes, canvases, and attachments through Quark Drive between Windows and Android. Each device connects to Quark directly over HTTPS.
+Sync Obsidian notes, canvases, and attachments through Quark Drive on Windows, Android, and iOS/iPadOS. Each device connects to Quark directly over HTTPS.
 
-The plugin uses Quark Drive's unofficial web API. Changes to that API or to account permissions may interrupt sign-in or sync. Android behavior depends on Obsidian's native HTTPS support and should be verified on your device.
+The plugin uses Quark Drive's unofficial web API. Changes to that API or to account permissions may interrupt sign-in or sync. Mobile sync uses Obsidian's native HTTPS bridge and should be verified on your device.
 
 ## Features
 
 - Sync Markdown notes, Canvas files, and ordinary attachments up to 10 MiB per file.
 - Preview the first sync and confirm it manually before any sync changes are applied.
 - Enable sync when Obsidian opens, periodic sync, or both. Both settings are off by default. Startup sync runs once after the vault loads. Periodic sync defaults to every five minutes while Obsidian is open.
-- Sign in by QR code on Windows and import an encrypted authorization code on Android. Manage the saved session in the Quark account section of the plugin settings.
+- Sign in by QR code on Windows, Android, or iOS/iPadOS. Mobile devices can also import an encrypted authorization code. Manage the saved session in the Quark account section of the plugin settings.
 - Preserve concurrent edits as local conflict copies. The vault's Obsidian configuration and conflict copies are excluded from sync.
 
 ## Sync dashboard
@@ -20,10 +20,20 @@ Select the cloud icon in the left ribbon or run **Open sync dashboard** to show 
 
 Vault usage comes from the file sizes Obsidian has indexed. The dashboard does not read note contents. Quark storage is account-wide and is shown only when the drive reports valid totals.
 
+## Use Quark files in notes
+
+Right-click in a note and select **Insert Quark Drive file**. You can also run it from the command palette on desktop or mobile. Browse your drive, then choose **Insert link only** or **Download to vault and insert**. Both actions write the same Markdown link. The private link opens on another device after you sign in with the same Quark account.
+
+Images, audio, and video from your drive can render in Reading View and Live Preview. Select a document link to open its preview in a main workspace tab. PDF and plain-text files are supported. Previews load on demand and allow up to 20 MiB for images and documents and 50 MiB for audio and video. Playback depends on the codecs your device supports.
+
+You can also paste an official `pan.quark.cn` share URL or use Obsidian’s external link command. The preview tab can browse shared folders, prompt for a passcode, and display supported images and PDFs. When Quark restricts access to the original, open the share in Quark. This applies to shared audio, video, and other files for which the guest download is unavailable.
+
+**Download to vault and insert** saves a local copy in `Quark Downloads/`. Personal downloads are capped at 100 MiB. The plugin uses that copy when available and syncs the note with its Quark link. It excludes files it downloaded and tracks from Quark sync, while ordinary attachments in the same folder remain eligible for sync. Save a copy to a regular attachment folder and link to it if you want to edit and sync the file itself.
+
 ## Install
 
 1. Download `main.js`, `manifest.json`, and `styles.css` from [GitHub Releases](https://github.com/18030838922/quark-note-sync/releases/latest).
-2. Put the three files directly inside `<vault>/.obsidian/plugins/quark-note-sync/`. On Android, use the folder for the vault Obsidian has actually opened. Your file manager may need to show hidden files.
+2. Put the three files directly inside `<vault>/.obsidian/plugins/quark-note-sync/`. Use the vault Obsidian has actually opened. On iOS/iPadOS, the Files app does not show hidden folders. See [how to access the configuration folder](https://obsidian.md/help/Files%2Band%2Bfolders/Configuration%2Bfolder) for manual installation.
 3. In Obsidian Settings → Community plugins, turn off Restricted mode if needed and enable **Quark Note Sync**.
 
 Requires Obsidian 1.11.4 or later. To update a manual installation, replace the three release files, keep any existing `data.json`, and reload Obsidian.
@@ -32,13 +42,13 @@ Requires Obsidian 1.11.4 or later. To update a manual installation, replace the 
 
 The plugin settings default to Simplified Chinese. Open the plugin’s settings and select **English** in the language dropdown at the top of the page.
 
-1. On Windows, select **Sign in with QR code** and scan the QR code with the Quark app. The plugin verifies the account and drive access before saving the session.
+1. On Windows or a mobile device, select **Sign in with QR code** and confirm the login in the Quark app. For same-device sign-in, capture the QR code and use the scanner’s album picker if available. Return to the open Obsidian login window after confirming. The plugin verifies the account and drive access before saving the session.
 2. Set a dedicated top-level Quark Drive folder for this vault. Use the same folder on both devices and a separate folder for every other vault.
 3. Select **Preview sync changes** to preview changes, then select **Sync now** and confirm the first sync. This first sync can create the target folder if needed.
-4. Once the target folder exists, select **Export to phone** on Windows and set a password of at least 12 characters. On Android, select **Import desktop authorization**, paste the code, and enter the same password. A code expires after 15 minutes. Import validates the account and target folder. Complete the first sync on Android separately.
+4. To use a pairing code as an alternative, wait until the target folder exists, then select **Export to phone** on Windows and set a password of at least 12 characters. On the mobile device, select **Import desktop authorization**, paste the code, and enter the same password. A code expires after 15 minutes. Import validates the account and target folder. Complete the first sync on each mobile device separately.
 5. Once the first sync is complete on a device, you can enable **Sync when Obsidian opens** or **Periodic sync** in its plugin settings.
 
-If a session expires, scan again on Windows or import a fresh authorization code on Android. Signing out clears the session on the current device and keeps its sync history. Advanced settings offer manual Cookie entry.
+If a session expires, scan a fresh QR code or import a fresh authorization code on your mobile device. Signing out clears the session on the current device and keeps its sync history. Advanced settings offer manual Cookie entry.
 
 ## Data and conflict handling
 
@@ -57,7 +67,7 @@ npm run check
 npm run build
 ```
 
-On Windows, `npm run package` runs the checks, builds the plugin, and creates `dist/quark-note-sync-<version>.zip` using Windows PowerShell. Automated tests use simulated requests. Live account and Android network behavior require testing on a real device.
+On Windows, `npm run package` runs the checks, builds the plugin, and creates `dist/quark-note-sync-<version>.zip` using Windows PowerShell. Automated tests use simulated requests. Live accounts and native network behavior must be tested on real devices. The iOS/iPadOS transport is covered with simulated bridge responses and has not yet been verified on a physical device.
 
 ## License
 

@@ -100,6 +100,20 @@ export class QuarkClient {
 		return await this.findChildByName('0', name);
 	}
 
+	async getFileById(fid: string): Promise<RemoteFile> {
+		if (!/^[\w-]{1,512}$/.test(fid)) throw new Error('夸克文件编号无效');
+		const data = await this.requestApi(`${DRIVE_API}/file/v2/info/list`, 'POST', {}, {
+			fids: [fid],
+			fetch_pdir_name: 1,
+			filter_secret_check_fail: 1,
+		});
+		const candidates = Array.isArray(data) ? data : asRecord(data).list;
+		if (!Array.isArray(candidates)) throw new Error('夸克文件详情响应不完整');
+		const match = candidates.find((value) => String(asRecord(value).fid ?? '') === fid);
+		if (!match) throw new Error('夸克中未找到此文件，或当前账号无权访问');
+		return normalizeRemoteFile(match);
+	}
+
 	async listDirectory(parentId: string): Promise<RemoteFile[]> {
 		const files: RemoteFile[] = [];
 		const seen = new Set<string>();
@@ -307,11 +321,14 @@ export class QuarkClient {
 		return this.confirmUploaded(parentId, name, content.byteLength, preFid);
 	}
 
-	async downloadFile(file: RemoteFile): Promise<Uint8Array> {
-		let response = await this.requestDownload(file);
+	async downloadFile(file: RemoteFile, maxBytes?: number): Promise<Uint8Array> {
+		if (maxBytes !== undefined && (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || file.size > maxBytes)) {
+			throw new Error(`夸克文件超过预览上限：${file.name}`);
+		}
+	let response = await this.requestDownload(file, maxBytes);
 		let failure = response.status === 403 ? readDownloadFailure(response.data) : undefined;
 		if (response.status === 403 && (!failure || failure.retryable)) {
-			response = await this.requestDownload(file);
+			response = await this.requestDownload(file, maxBytes);
 			failure = response.status === 403 ? readDownloadFailure(response.data) : undefined;
 		}
 		if (response.status !== 200) {
@@ -322,7 +339,7 @@ export class QuarkClient {
 		return response.data;
 	}
 
-	private async requestDownload(file: RemoteFile): Promise<HttpResponse> {
+	private async requestDownload(file: RemoteFile, maxBytes?: number): Promise<HttpResponse> {
 		const data = await this.requestApi(`${DRIVE_API}/file/download`, 'POST', {}, { fids: [file.fid] });
 		const candidates = Array.isArray(data) ? data : asRecord(data).list;
 		const entries: unknown[] = Array.isArray(candidates) ? candidates : [];
@@ -338,6 +355,7 @@ export class QuarkClient {
 			cookie: this.cookie,
 			purpose: 'download',
 			responseKind: 'arraybuffer',
+			...(maxBytes === undefined ? {} : { maxResponseBytes: maxBytes }),
 			headers: {
 				Accept: 'application/octet-stream,*/*',
 				Referer: 'https://pan.quark.cn/',

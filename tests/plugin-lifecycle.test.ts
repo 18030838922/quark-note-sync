@@ -29,7 +29,7 @@ function renderedText(node: TextNode): string[] {
 	return [node.text ?? '', ...node.children.flatMap(renderedText)];
 }
 
-async function loadPlugin(data: object, savedCookie: string | null = 'sid=fixture') {
+async function loadPlugin(data: object, savedCookie: string | null = 'sid=fixture', platform: 'desktop' | 'ios' | 'android' = 'desktop') {
 	const notices: string[] = [];
 	let settingsTab!: { display(): void; containerEl: TextNode };
 	let changeLanguage!: (value: string) => Promise<void>;
@@ -68,6 +68,8 @@ async function loadPlugin(data: object, savedCookie: string | null = 'sid=fixtur
 		}
 	}
 	const commands = new Map<string, { callback?: () => void; checkCallback?: (checking: boolean) => boolean }>();
+	const workspaceEvents = new Map<string, (...args: unknown[]) => void>();
+	const protocolHandlers = new Map<string, (params: Record<string, string>) => void>();
 	const readyCallbacks: Array<() => void> = [];
 	const sideRequests: Array<{ type: string; side: string; reveal?: boolean }> = [];
 	type Sidebar = { actions: QuarkDashboardActions; view: QuarkDashboardView };
@@ -84,7 +86,9 @@ async function loadPlugin(data: object, savedCookie: string | null = 'sid=fixtur
 	let quotaRequests = 0;
 	const app = {
 		workspace: {
+			on: (name: string, callback: (...args: unknown[]) => void) => { workspaceEvents.set(name, callback); return { name, callback }; },
 			onLayoutReady: (callback: () => void) => readyCallbacks.push(callback),
+			getActiveViewOfType: () => null,
 			getLeavesOfType: () => sidebarLeaf ? [sidebarLeaf] : [],
 			async ensureSideLeaf(type: string, side: string, options: { reveal?: boolean }) {
 				sideRequests.push({ type, side, reveal: options.reveal });
@@ -103,6 +107,7 @@ async function loadPlugin(data: object, savedCookie: string | null = 'sid=fixtur
 			configDir: '.obsidian',
 			getName: () => 'Test vault',
 			getFiles: () => [{ path: 'Notes/Test.md', extension: 'md', stat: { size: 42 } }],
+			on: (name: string, callback: (...args: unknown[]) => void) => ({ name, callback }),
 		},
 	};
 	class Plugin {
@@ -110,14 +115,24 @@ async function loadPlugin(data: object, savedCookie: string | null = 'sid=fixtur
 		async loadData() { return state; }
 		async saveData(value: object) { Object.assign(state, value); }
 		addRibbonIcon() {}
-		registerView(_type: string, createView: typeof factory) { factory = createView; }
+		registerView(type: string, createView: typeof factory) { if (type === 'quark-note-sync-dashboard') factory = createView; }
 		addSettingTab(tab: typeof settingsTab) { settingsTab = tab; }
 		addCommand(command: { id: string; callback?: () => void; checkCallback?: (checking: boolean) => boolean }) {
 			commands.set(command.id, command);
 		}
+		registerEvent(event: { name?: string; callback?: (...args: unknown[]) => void }) {
+			if (event.name && event.callback) workspaceEvents.set(event.name, event.callback);
+		}
+		registerMarkdownPostProcessor() {}
+		registerEditorExtension() {}
+		registerObsidianProtocolHandler(action: string, handler: (params: Record<string, string>) => void) {
+			protocolHandlers.set(action, handler);
+		}
 	}
 	const obsidian = {
 		Plugin,
+		MarkdownView: class {},
+		MarkdownRenderChild: class {},
 		PluginSettingTab: SettingsTab,
 		Setting,
 		ItemView: class {
@@ -127,7 +142,12 @@ async function loadPlugin(data: object, savedCookie: string | null = 'sid=fixtur
 		Modal: class { open() { modalOpens += 1; } close() {} },
 		setIcon() {},
 		Notice: class { constructor(message: string) { notices.push(message); } },
-		Platform: { isDesktopApp: true, isMobileApp: false, isAndroidApp: false },
+		Platform: {
+			isDesktopApp: platform === 'desktop',
+			isMobileApp: platform !== 'desktop',
+			isIosApp: platform === 'ios',
+			isAndroidApp: platform === 'android',
+		},
 	};
 	const window = {
 		setInterval(callback: () => void) { intervals.set(++nextInterval, callback); return nextInterval; },
@@ -164,6 +184,7 @@ async function loadPlugin(data: object, savedCookie: string | null = 'sid=fixtur
 	await plugin.onload();
 	return {
 		plugin, state, commands, notices, intervals,
+		workspaceEvents, protocolHandlers,
 		fireLayoutReady: () => readyCallbacks.forEach((callback) => callback()),
 		setRequestStatus: (status: number) => { requestStatus = status; },
 		requestCount: () => requests,
@@ -321,4 +342,42 @@ test('first sync uses the sidebar preview and cannot run until confirmed there',
 	assert.equal(fixture.state.initialSyncCompleted, true);
 	assert.equal(fixture.readSidebar()?.view.inline, undefined);
 	assert.equal(fixture.modalCount(), 0);
+});
+
+
+test('iOS and Android can open QR login without a desktop pairing code', async () => {
+	for (const [platform, deviceName] of [['ios', 'iOS'], ['android', 'Android']] as const) {
+		const fixture = await loadPlugin({}, null, platform);
+		fixture.showSettings();
+		assert.equal(fixture.plugin.deviceName, deviceName);
+		assert.ok(fixture.settingsText().includes('导入电脑授权'));
+		assert.ok(fixture.settingsText().includes('扫码登录'));
+		const command = fixture.commands.get('quark-qr-login')?.checkCallback;
+		assert.equal(command?.(true), true);
+		assert.equal(fixture.modalCount(), 0);
+		assert.equal(command?.(false), true);
+		assert.equal(fixture.modalCount(), 1);
+	}
+});
+
+test('Quark Drive browse command and public editor menu are registered', async () => {
+	const fixture = await loadPlugin({});
+	assert.ok(fixture.commands.has('browse-quark-drive'));
+	assert.ok(fixture.protocolHandlers.has('quark-note'));
+	assert.equal(typeof fixture.workspaceEvents.get('editor-menu'), 'function');
+	const titles: string[] = [];
+	const menu = {
+		addItem(callback: (item: unknown) => void) {
+			callback({
+				setTitle(title: string) { titles.push(title); return this; },
+				setIcon() { return this; },
+				onClick() { return this; },
+			});
+			return this;
+		},
+	};
+	fixture.workspaceEvents.get('editor-menu')?.(menu, {
+		getSelection: () => '', getCursor: () => ({ line: 0, ch: 0 }), getLine: () => '',
+	}, {});
+	assert.ok(titles.some((title) => /夸克|Quark/.test(title)));
 });

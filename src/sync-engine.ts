@@ -18,6 +18,7 @@ export interface PlanInput {
 	protectedPaths?: Map<string, string>;
 	snapshots: Record<string, SyncSnapshot>;
 	remoteEvents: VersionEvent[];
+	managedPaths?: readonly string[];
 	deviceId: string;
 	now: number;
 	configDir?: string;
@@ -41,6 +42,7 @@ export interface SyncPlan {
 
 export async function buildSyncPlan(input: PlanInput): Promise<SyncPlan> {
 	const configDir = input.configDir ?? '.obsidian';
+	const managedPathKeys = new Set((input.managedPaths ?? []).map(pathKey));
 	const skipped: Array<{ path: string; reason: string }> = [];
 	const skippedPaths = new Set<string>();
 	const addSkipped = (path: string, reason: string) => {
@@ -51,6 +53,7 @@ export async function buildSyncPlan(input: PlanInput): Promise<SyncPlan> {
 	};
 	const localByPath = new Map<string, LocalFileState>();
 	for (const file of input.localFiles) {
+		if (managedPathKeys.has(pathKey(file.path))) continue;
 		if (localByPath.has(file.path)) {
 			addSkipped(file.path, '本地出现重复路径');
 			continue;
@@ -59,15 +62,16 @@ export async function buildSyncPlan(input: PlanInput): Promise<SyncPlan> {
 	}
 	const remoteByPath = new Map<string, VersionEvent[]>();
 	for (const event of input.remoteEvents) {
+		if (managedPathKeys.has(pathKey(event.path))) continue;
 		const list = remoteByPath.get(event.path) ?? [];
 		list.push(event);
 		remoteByPath.set(event.path, list);
 	}
 
 	const candidatePaths = new Set<string>([
-		...input.presentPaths,
-		...input.localFiles.map((file) => file.path),
-		...Object.keys(input.snapshots),
+		...input.presentPaths.filter((path) => !managedPathKeys.has(pathKey(path))),
+		...input.localFiles.map((file) => file.path).filter((path) => !managedPathKeys.has(pathKey(path))),
+		...Object.keys(input.snapshots).filter((path) => !managedPathKeys.has(pathKey(path))),
 		...remoteByPath.keys(),
 	]);
 	const validPaths: string[] = [];
@@ -84,13 +88,13 @@ export async function buildSyncPlan(input: PlanInput): Promise<SyncPlan> {
 	} catch (error) {
 		const reason = `路径冲突，已暂停本轮合并：${error instanceof Error ? error.message : '无法安全映射到此设备'}`;
 		for (const path of validPaths) addSkipped(path, reason);
-		return { events: [], paths: [], skipped, nextSnapshots: copySnapshots(input.snapshots) };
+		return { events: [], paths: [], skipped, nextSnapshots: copySnapshots(input.snapshots, managedPathKeys) };
 	}
 
 	const protectedPaths = input.protectedPaths ?? new Map<string, string>();
 	const allEvents: VersionEvent[] = [];
 	const paths: PlannedPath[] = [];
-	const nextSnapshots = copySnapshots(input.snapshots);
+	const nextSnapshots = copySnapshots(input.snapshots, managedPathKeys);
 	for (const path of validPaths) {
 		const protectedReason = protectedPaths.get(path);
 		if (protectedReason) {
@@ -179,12 +183,17 @@ export async function buildSyncPlan(input: PlanInput): Promise<SyncPlan> {
 	return { events: allEvents, paths, skipped, nextSnapshots };
 }
 
-function copySnapshots(input: Record<string, SyncSnapshot>): Record<string, SyncSnapshot> {
+function copySnapshots(input: Record<string, SyncSnapshot>, excludedPathKeys = new Set<string>()): Record<string, SyncSnapshot> {
 	const output = Object.create(null) as Record<string, SyncSnapshot>;
 	for (const [path, snapshot] of Object.entries(input)) {
+		if (excludedPathKeys.has(pathKey(path))) continue;
 		output[path] = { hash: snapshot.hash, heads: [...snapshot.heads] };
 	}
 	return output;
+}
+
+function pathKey(path: string): string {
+	return path.replace(/\\/g, '/').normalize('NFKC').toLowerCase();
 }
 
 function hasOwn(input: object, key: PropertyKey): boolean {

@@ -1,8 +1,8 @@
 {
   "name": "quark-note-sync",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "private": true,
-  "description": "Windows 和 Android 版 Obsidian 夸克网盘同步插件",
+  "description": "Windows、Android 和 iOS 版 Obsidian 夸克网盘同步插件",
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test \"tests/*.test.ts\"",

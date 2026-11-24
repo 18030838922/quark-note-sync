@@ -7,6 +7,7 @@ import { QuarkAuthenticationError, QuarkClient } from './quark-api.ts';
 import { buildSyncPlan, type SyncPlan, type SyncSnapshot } from './sync-engine.ts';
 import { recoverPendingApply } from './core.ts';
 import { applyIfCurrentHash } from './safe-apply.ts';
+import { managedDownloadPaths, type SourceIndex } from './source-index.ts';
 
 const CLOUD_DATA_DIRECTORY = 'Obsidian Sync Data';
 const CLOUD_BLOB_DIRECTORY = 'blobs';
@@ -28,6 +29,7 @@ export interface SyncStatePort {
 	deviceId: string;
 	snapshots: Record<string, SyncSnapshot>;
 	pendingApplies: Record<string, PendingApplyState>;
+	sourceIndex?: SourceIndex;
 	persist(): Promise<void>;
 }
 
@@ -71,7 +73,7 @@ export class QuarkSyncService {
 	async preview(): Promise<SyncPlan> {
 		await this.client.checkConnection();
 		const remote = await this.readRemoteContext(false);
-		const scan = await this.local.scan(this.app.vault.configDir);
+		const scan = await this.local.scan(this.app.vault.configDir, this.managedPaths());
 		return await this.makePlan(remote.events, scan);
 	}
 
@@ -80,7 +82,7 @@ export class QuarkSyncService {
 		await this.client.checkConnection();
 		const layout = await this.ensureCloudLayout();
 		const remote = await this.readRemoteContext(false, layout);
-		const scan = await this.local.scan(this.app.vault.configDir);
+		const scan = await this.local.scan(this.app.vault.configDir, this.managedPaths());
 		const plan = await this.makePlan(remote.events, scan);
 		const skipped = [...plan.skipped];
 		let uploaded = 0;
@@ -128,10 +130,15 @@ export class QuarkSyncService {
 			protectedPaths: scan.protectedPaths,
 			snapshots: this.state.snapshots,
 			remoteEvents,
+			managedPaths: [...this.managedPaths()],
 			deviceId: this.state.deviceId,
 			now: Date.now(),
 			configDir: this.app.vault.configDir,
 		});
+	}
+
+	private managedPaths(): Set<string> {
+		return managedDownloadPaths(this.state.sourceIndex ?? Object.create(null) as SourceIndex);
 	}
 
 	private async readRemoteContext(create: boolean, existingLayout?: CloudLayout): Promise<RemoteContext> {
@@ -354,6 +361,11 @@ export class QuarkSyncService {
 	private async recoverPendingApplies(): Promise<void> {
 		let changed = false;
 		for (const [path, pending] of Object.entries(this.state.pendingApplies)) {
+			if ([...this.managedPaths()].some((managedPath) => pathKey(managedPath) === pathKey(path))) {
+				delete this.state.pendingApplies[path];
+				changed = true;
+				continue;
+			}
 			const currentHash = await this.local.currentHash(path).catch(() => '__read-error__');
 			const recovery = recoverPendingApply(currentHash, pending);
 			if (recovery === 'finish') {
@@ -364,6 +376,10 @@ export class QuarkSyncService {
 		}
 		if (changed) await this.state.persist();
 	}
+}
+
+function pathKey(path: string): string {
+	return path.replace(/\\/g, '/').normalize('NFKC').toLowerCase();
 }
 
 function conflictPathFor(path: string, event: VersionEvent): string {

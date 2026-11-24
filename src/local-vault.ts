@@ -23,11 +23,13 @@ export class LocalVaultAdapter {
 		this.app = app;
 	}
 
-	async scan(configDir: string): Promise<LocalScan> {
+	async scan(configDir: string, managedPaths: ReadonlySet<string> = new Set()): Promise<LocalScan> {
+		const managedPathKeys = new Set([...managedPaths].map(pathKey));
 		const files: LocalFileState[] = [];
 		const presentPaths: string[] = [];
 		const protectedPaths = new Map<string, string>();
 		for (const file of this.app.vault.getFiles()) {
+			if (managedPathKeys.has(pathKey(file.path))) continue;
 			if (
 				isWithinDirectory(file.path, configDir) ||
 				isWithinDirectory(file.path, '.trash') ||
@@ -196,6 +198,10 @@ export function isWithinDirectory(path: string, directory: string): boolean {
 	const normalizedPath = path.replace(/\\/g, '/').normalize('NFKC').toLowerCase();
 	const normalizedDirectory = directory.replace(/\\/g, '/').replace(/\/$/, '').normalize('NFKC').toLowerCase();
 	return normalizedPath === normalizedDirectory || normalizedPath.startsWith(`${normalizedDirectory}/`);
+}
+
+function pathKey(path: string): string {
+	return path.replace(/\\/g, '/').normalize('NFKC').toLowerCase();
 }
 
 export function toBytes(input: ArrayBuffer | Uint8Array): Uint8Array {

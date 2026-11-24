@@ -13,7 +13,7 @@ await build({
 	platform: 'browser',
 	format: 'cjs',
 	target: 'es2020',
-	external: ['obsidian', 'electron'],
+	external: ['obsidian', 'electron', '@codemirror/state', '@codemirror/view', '@codemirror/language'],
 	banner: { js: '/*\n' + licenses.map((text) => text.trimEnd()).join('\n\n') + '\n*/' },
 	outfile: 'main.js',
 	logLevel: 'info',

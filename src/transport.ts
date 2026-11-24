@@ -5,7 +5,7 @@ const COOKIE_API_HOSTS = new Set(['drive-pc.quark.cn', 'drive.quark.cn', 'pan.qu
 
 export type QuarkHostKind = 'authenticated-api' | 'quark-transfer';
 export type ResponseKind = 'text' | 'arraybuffer';
-export type RequestPurpose = 'api' | 'download' | 'upload' | 'login';
+export type RequestPurpose = 'api' | 'download' | 'upload' | 'login' | 'share-api' | 'share-preview';
 
 export interface HttpRequest {
 	url: string;
@@ -15,6 +15,7 @@ export interface HttpRequest {
 	body?: string | Uint8Array;
 	responseKind?: ResponseKind;
 	purpose?: RequestPurpose;
+	maxResponseBytes?: number;
 }
 
 export interface HttpResponse {
@@ -32,7 +33,10 @@ export class QuarkTransportError extends Error {
 	}
 }
 
-export function classifyQuarkUrl(input: string, purpose: RequestPurpose = 'api'): QuarkHostKind | 'quark-download' | 'oss-upload' | 'quark-login' {
+export function classifyQuarkUrl(
+	input: string,
+	purpose: RequestPurpose = 'api',
+): QuarkHostKind | 'quark-download' | 'oss-upload' | 'quark-login' | 'quark-share-api' | 'quark-share-preview' {
 	let url: URL;
 	try {
 		url = new URL(input);
@@ -54,6 +58,19 @@ export function classifyQuarkUrl(input: string, purpose: RequestPurpose = 'api')
 	} else if (purpose === 'download') {
 		if (COOKIE_API_HOSTS.has(url.hostname)) return 'authenticated-api';
 		if (url.hostname.endsWith('.pds.quark.cn')) return 'quark-download';
+	} else if (purpose === 'share-api') {
+		if (url.hostname === 'pan.quark.cn' && [
+			'/1/clouddrive/share/sharepage/token',
+			'/1/clouddrive/share/sharepage/detail',
+			'/1/clouddrive/share/sharepage/preview',
+			'/1/clouddrive/share/sharepage/pdf_preview',
+		].includes(url.pathname)) return 'quark-share-api';
+	} else if (purpose === 'share-preview') {
+		if ([
+			'img-view-c-zb.drive.quark.cn',
+			'img-view-c-sz.drive.quark.cn',
+			'dl-c-sz-u.drive.quark.cn',
+		].includes(url.hostname)) return 'quark-share-preview';
 	} else {
 		if (url.hostname.endsWith('.pds.quark.cn') || url.hostname.endsWith('.aliyuncs.com')) return 'oss-upload';
 	}
@@ -84,22 +101,25 @@ export function assertNoRedirect(status: number, _location?: string): void {
 	}
 }
 
-export class QuarkTransport {
-	private readonly isMobile: boolean;
+type TransportPlatform = 'desktop' | 'ios' | 'android' | 'mobile';
 
-	constructor(isMobile: boolean) {
-		this.isMobile = isMobile;
-	}
+export class QuarkTransport {
+	constructor(private readonly platform: TransportPlatform) {}
 
 	async request(request: HttpRequest): Promise<HttpResponse> {
 		if (request.purpose === 'login' && request.method !== 'GET') {
 			throw new QuarkTransportError('夸克网页登录只允许固定的 GET 请求');
 		}
 		classifyQuarkUrl(request.url, request.purpose);
+		if (request.purpose === 'share-api') assertShareApiMethod(request.url, request.method);
+		if (request.purpose === 'share-preview' && request.method !== 'GET') {
+			throw new QuarkTransportError('夸克分享预览只允许固定的 GET 请求');
+		}
+		const maxResponseBytes = validateMaxResponseBytes(request.maxResponseBytes);
 		const headers = createSafeHeaders(request.url, request.cookie, request.headers, request.purpose);
-		const response = this.isMobile
-			? await this.requestWithCapacitor(request, headers)
-			: await this.requestWithNodeHttps(request, headers);
+		const response = this.platform !== 'desktop'
+			? await this.requestWithCapacitor(request, headers, maxResponseBytes)
+			: await this.requestWithNodeHttps(request, headers, maxResponseBytes);
 		assertNoRedirect(response.status, response.headers.location);
 		if (response.url && response.url !== request.url) {
 			throw new QuarkTransportError('请求地址发生变化，已停止处理响应');
@@ -110,6 +130,7 @@ export class QuarkTransport {
 	private async requestWithCapacitor(
 		request: HttpRequest,
 		headers: Record<string, string>,
+		maxResponseBytes?: number,
 	): Promise<HttpResponse> {
 		const bridge = (window as Window & {
 			Capacitor?: {
@@ -137,14 +158,19 @@ export class QuarkTransport {
 		const responseUrl = typeof response.url === 'string' ? response.url : request.url;
 		const contentType = responseHeaders['content-type'] ?? '';
 		const status = Number(response.status ?? 0);
-		const responseKind = status >= 200 && status < 300 ? request.responseKind ?? 'text' : 'text';
+		assertDeclaredLengthWithinLimit(responseHeaders, maxResponseBytes);
+		// iOS applies responseType to error bodies too. Android returns errors as text or JSON.
+		const useRequestedKind = this.platform === 'ios' || (status >= 200 && status < 300);
+		const responseKind = useRequestedKind ? request.responseKind ?? 'text' : 'text';
 		const bytes = normalizeNativeBody(response.data, responseKind, contentType);
+		assertResponseLengthWithinLimit(bytes, maxResponseBytes);
 		return makeResponse(status, responseHeaders, responseUrl, bytes);
 	}
 
 	private async requestWithNodeHttps(
 		request: HttpRequest,
 		headers: Record<string, string>,
+		maxResponseBytes?: number,
 	): Promise<HttpResponse> {
 		const nodeRequire = getNodeRequire();
 		if (!nodeRequire) throw new QuarkTransportError('桌面 HTTPS 接口不可用');
@@ -153,6 +179,12 @@ export class QuarkTransport {
 		const body = request.body instanceof Uint8Array ? request.body : request.body ? new TextEncoder().encode(request.body) : undefined;
 		if (body) headers['Content-Length'] = String(body.byteLength);
 		return await new Promise<HttpResponse>((resolve, reject) => {
+			let settled = false;
+			const fail = (error: Error): void => {
+				if (settled) return;
+				settled = true;
+				reject(error);
+			};
 			const outbound = https.request({
 				protocol: 'https:',
 				hostname: url.hostname,
@@ -162,11 +194,30 @@ export class QuarkTransport {
 				headers,
 				timeout: 60000,
 			}, (incoming: IncomingMessage) => {
+				try {
+					assertDeclaredLengthWithinLimit(normalizeHeaders(incoming.headers), maxResponseBytes);
+				} catch (error) {
+					fail(error instanceof Error ? error : new QuarkTransportError('夸克响应超过安全大小限制'));
+					incoming.destroy();
+					outbound.destroy();
+					return;
+				}
 				const chunks: Uint8Array[] = [];
+				let receivedBytes = 0;
 				incoming.on('data', (chunk: Uint8Array | string) => {
-					chunks.push(typeof chunk === 'string' ? new TextEncoder().encode(chunk) : new Uint8Array(chunk));
+					if (settled) return;
+					const bytes = typeof chunk === 'string' ? new TextEncoder().encode(chunk) : new Uint8Array(chunk);
+					if (maxResponseBytes !== undefined && receivedBytes + bytes.byteLength > maxResponseBytes) {
+						fail(new QuarkTransportError('夸克响应超过安全大小限制'));
+						incoming.destroy();
+						outbound.destroy();
+						return;
+					}
+					receivedBytes += bytes.byteLength;
+					chunks.push(bytes);
 				});
 				incoming.on('end', () => {
+					if (settled) return;
 					const length = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
 					const data = new Uint8Array(length);
 					let offset = 0;
@@ -174,16 +225,49 @@ export class QuarkTransport {
 						data.set(chunk, offset);
 						offset += chunk.byteLength;
 					}
+					settled = true;
 					resolve(makeResponse(incoming.statusCode ?? 0, normalizeHeaders(incoming.headers), request.url, data));
 				});
-				incoming.on('error', reject);
+				incoming.on('error', fail);
 			});
 			outbound.on('timeout', () => outbound.destroy(new QuarkTransportError('夸克请求超时')));
-			outbound.on('error', reject);
+			outbound.on('error', fail);
 			if (body) outbound.write(body);
 			outbound.end();
 		});
 	}
+}
+
+function assertShareApiMethod(input: string, method: string): void {
+	const url = new URL(input);
+	const expectedMethod: Record<string, string> = {
+		'/1/clouddrive/share/sharepage/token': 'POST',
+		'/1/clouddrive/share/sharepage/detail': 'GET',
+		'/1/clouddrive/share/sharepage/preview': 'GET',
+		'/1/clouddrive/share/sharepage/pdf_preview': 'GET',
+	};
+	if (expectedMethod[url.pathname] !== method) {
+		throw new QuarkTransportError('夸克分享接口只允许已验证的固定请求方式');
+	}
+}
+
+function validateMaxResponseBytes(input: number | undefined): number | undefined {
+	if (input === undefined) return undefined;
+	if (!Number.isSafeInteger(input) || input <= 0) throw new QuarkTransportError('夸克响应大小限制无效');
+	return input;
+}
+
+function assertDeclaredLengthWithinLimit(headers: Record<string, string>, limit?: number): void {
+	if (limit === undefined) return;
+	const value = headers['content-length'];
+	if (value === undefined) return;
+	const length = Number(value);
+	if (!Number.isSafeInteger(length) || length < 0) throw new QuarkTransportError('夸克响应长度无效');
+	if (length > limit) throw new QuarkTransportError('夸克响应超过安全大小限制');
+}
+
+function assertResponseLengthWithinLimit(data: Uint8Array, limit?: number): void {
+	if (limit !== undefined && data.byteLength > limit) throw new QuarkTransportError('夸克响应超过安全大小限制');
 }
 
 export function normalizeNativeBody(input: unknown, responseKind: ResponseKind, contentType: string): Uint8Array {
