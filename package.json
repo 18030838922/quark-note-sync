@@ -1,0 +1,24 @@
+{
+  "name": "quark-note-sync",
+  "version": "0.3.1",
+  "private": true,
+  "description": "Windows 和 Android 版 Obsidian 夸克网盘同步插件",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test \"tests/*.test.ts\"",
+    "check": "npm run typecheck && npm test",
+    "build": "node scripts/build.mjs",
+    "package": "npm run check && npm run build && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package.ps1"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.19",
+    "esbuild": "0.25.12",
+    "obsidian": "1.14.4",
+    "tsx": "4.23.15",
+    "typescript": "6.0.3"
+  },
+  "dependencies": {
+    "qrcode": "1.5.4"
+  },
+  "license": "MIT"
+}

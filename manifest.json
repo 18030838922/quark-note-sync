@@ -1,0 +1,10 @@
+{
+  "id": "quark-note-sync",
+  "name": "夸克笔记同步",
+  "version": "0.3.1",
+  "minAppVersion": "1.11.4",
+  "description": "在 Windows 和 Android 设备间通过夸克网盘同步 Obsidian 笔记。",
+  "isDesktopOnly": false,
+  "author": "Skyone",
+  "authorUrl": "https://github.com/18030838922"
+}
