@@ -16,12 +16,14 @@ import { QuarkAuthenticationError, QuarkClient } from './quark-api.ts';
 import { QuarkTransport, type HttpRequest, type HttpResponse } from './transport.ts';
 import { QuarkQrLogin, type QuarkQrSession } from './quark-login.ts';
 import { createPairingCode, readPairingCode, type PairingPayload } from './pairing-code.ts';
+import { settingsText, type Language } from './settings-text.ts';
 
 const PLUGIN_ID = 'quark-note-sync';
 const DEFAULT_CLOUD_DIRECTORY = 'Obsidian Notes';
 const DEFAULT_AUTO_SYNC_MINUTES = 5;
 
 interface PluginSettings {
+	language: Language;
 	cloudDirectoryName: string;
 	deviceName: string;
 	autoSync: boolean;
@@ -116,7 +118,7 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		}
 	}
 
-	get settingsView(): Pick<PluginSettings, 'cloudDirectoryName' | 'deviceName' | 'autoSync' | 'syncOnStartup' | 'autoSyncIntervalMinutes' | 'lastSummary'> {
+	get settingsView(): Pick<PluginSettings, 'language' | 'cloudDirectoryName' | 'deviceName' | 'autoSync' | 'syncOnStartup' | 'autoSyncIntervalMinutes' | 'lastSummary'> {
 		return this.config;
 	}
 
@@ -136,9 +138,10 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		if (!this.savedCookieExists) return { state: 'signed-out' };
 		if (this.config.sessionExpired) return { state: 'expired' };
 		const id = this.config.boundAccountId;
+		const copy = settingsText[this.config.language];
 		return {
 			state: 'connected',
-			label: this.accountNickname ?? (id && id.length > 4 ? '账号 ····' + id.slice(-4) : '夸克账号'),
+			label: this.accountNickname ?? (id && id.length > 4 ? copy.accountId + id.slice(-4) : copy.account),
 		};
 	}
 
@@ -299,6 +302,20 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		this.config.deviceName = name;
 		await this.persistData();
 		new Notice('设备名称已保存；同步身份仍使用独立设备 ID');
+	}
+
+	async setLanguage(language: string): Promise<boolean> {
+		if (this.busy || this.unloading || (language !== 'zh-CN' && language !== 'en')) return false;
+		const previous = this.config.language;
+		this.config.language = language;
+		try {
+			await this.persistData();
+			return true;
+		} catch {
+			this.config.language = previous;
+			new Notice(settingsText[previous].languageFailed);
+			return false;
+		}
 	}
 
 	async setAutoSync(enabled: boolean): Promise<void> {
@@ -640,6 +657,7 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 	private async persistData(): Promise<void> {
 		if (this.unloading) return;
 		await this.saveData({
+			language: this.config.language,
 			cloudDirectoryName: this.config.cloudDirectoryName,
 			deviceName: this.config.deviceName,
 			autoSync: this.config.autoSync,
@@ -669,12 +687,28 @@ class QuarkSettingsTab extends PluginSettingTab {
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
-		containerEl.createEl('h2', { text: '夸克笔记同步' });
+		const language = this.plugin.settingsView.language;
+		const copy = settingsText[language];
+		containerEl.createEl('h2', { text: copy.title });
+		new Setting(containerEl)
+			.setName('语言 / Language')
+			.addDropdown((dropdown) => dropdown
+				.addOption('zh-CN', '简体中文')
+				.addOption('en', 'English')
+				.setValue(language)
+				.onChange(async (value) => {
+					dropdown.setDisabled(true);
+					const changed = await this.plugin.setLanguage(value);
+					if (changed && this.accountSection) this.display();
+					else dropdown.setValue(this.plugin.settingsView.language).setDisabled(false);
+				}));
 		const last = this.plugin.settingsView.lastSummary;
 		containerEl.createEl('p', {
 			text: last
-				? `上次同步：上传 ${last.uploaded}，下载 ${last.downloaded}，删除 ${last.deleted}，冲突 ${last.conflicts}，跳过 ${last.skipped.length}`
-				: '上次同步：暂无记录',
+				? language === 'en'
+					? `Last sync: ${last.uploaded} uploaded, ${last.downloaded} downloaded, ${last.deleted} deleted, ${last.conflicts} conflicts, ${last.skipped.length} skipped`
+					: `上次同步：上传 ${last.uploaded}，下载 ${last.downloaded}，删除 ${last.deleted}，冲突 ${last.conflicts}，跳过 ${last.skipped.length}`
+				: copy.noSummary,
 		});
 
 		this.accountSection = containerEl.createDiv();
@@ -682,32 +716,32 @@ class QuarkSettingsTab extends PluginSettingTab {
 
 		let cookieInput!: TextComponent;
 		const advanced = containerEl.createEl('details');
-		advanced.createEl('summary', { text: '高级设置（手动 Cookie）' });
+		advanced.createEl('summary', { text: copy.advanced });
 		new Setting(advanced)
-			.setName('夸克 Cookie')
-			.setDesc('扫码登录或授权导入不可用时，可在此手动录入。Cookie 保存在 Obsidian 安全存储中；输入框不会回填已保存内容。留空保存会清除此设备的 Cookie。')
+			.setName(copy.cookie)
+			.setDesc(copy.cookieHelp)
 			.addText((text) => {
 				cookieInput = text;
 				text.inputEl.type = 'password';
 				text.inputEl.autocomplete = 'off';
 				text.inputEl.setAttribute('autocapitalize', 'off');
 				text.inputEl.setAttribute('spellcheck', 'false');
-				text.setPlaceholder(this.plugin.savedCookieExists ? '此设备已保存；输入新 Cookie 可替换' : '粘贴此设备的夸克 Cookie');
+				text.setPlaceholder(this.plugin.savedCookieExists ? copy.cookieSaved : copy.cookieEmpty);
 				text.setDisabled(this.plugin.isBusy);
 			})
 			.addButton((button) => button
-				.setButtonText('保存 Cookie')
+				.setButtonText(copy.saveCookie)
 				.setDisabled(this.plugin.isBusy)
 				.onClick(async () => {
 					await this.plugin.saveCookie(cookieInput.getValue());
 					cookieInput.setValue('');
-					cookieInput.setPlaceholder(this.plugin.savedCookieExists ? '此设备已保存；输入新 Cookie 可替换' : '粘贴此设备的夸克 Cookie');
+					cookieInput.setPlaceholder(this.plugin.savedCookieExists ? copy.cookieSaved : copy.cookieEmpty);
 				}));
 
 		let cloudInput!: TextComponent;
 		new Setting(containerEl)
-			.setName('夸克云端目录')
-			.setDesc('云盘根目录下的单层文件夹名称；切换已有同步状态会要求确认并清除本地快照。')
+			.setName(copy.cloudFolder)
+			.setDesc(copy.cloudFolderHelp)
 			.addText((text) => {
 				cloudInput = text;
 				text.setValue(this.plugin.settingsView.cloudDirectoryName);
@@ -715,36 +749,36 @@ class QuarkSettingsTab extends PluginSettingTab {
 				text.setDisabled(this.plugin.isBusy);
 			})
 			.addButton((button) => button
-				.setButtonText('保存')
+				.setButtonText(copy.save)
 				.setDisabled(this.plugin.isBusy)
 				.onClick(() => void this.plugin.saveCloudDirectoryName(cloudInput.getValue())));
 
 		let deviceInput!: TextComponent;
 		new Setting(containerEl)
-			.setName('设备名称')
-			.setDesc('仅用于本机辨识；同步历史仍使用独立且唯一的设备 ID。')
+			.setName(copy.deviceName)
+			.setDesc(copy.deviceHelp)
 			.addText((text) => {
 				deviceInput = text;
 				text.setValue(this.plugin.settingsView.deviceName);
-				text.setPlaceholder('例如：Windows PC');
+				text.setPlaceholder(copy.deviceExample);
 				text.setDisabled(this.plugin.isBusy);
 			})
 			.addButton((button) => button
-				.setButtonText('保存')
+				.setButtonText(copy.save)
 				.setDisabled(this.plugin.isBusy)
 				.onClick(() => void this.plugin.saveDeviceName(deviceInput.getValue())));
 
 		new Setting(containerEl)
-			.setName('自动同步')
-			.setDesc(this.plugin.isFirstSyncComplete ? '应用打开期间按设定间隔同步；默认关闭。' : '首次手动确认并完成同步后才能开启。')
+			.setName(copy.periodic)
+			.setDesc(this.plugin.isFirstSyncComplete ? copy.periodicHelp : copy.firstSyncRequired)
 			.addToggle((toggle) => toggle
 				.setValue(this.plugin.settingsView.autoSync)
 				.setDisabled(this.plugin.isBusy || !this.plugin.isFirstSyncComplete)
 				.onChange((value) => void this.plugin.setAutoSync(value)));
 
 		new Setting(containerEl)
-			.setName('打开 Obsidian 时同步')
-			.setDesc(this.plugin.isFirstSyncComplete ? '仓库载入后同步一次，独立于定时同步。' : '首次手动确认并完成同步后才能开启。')
+			.setName(copy.startup)
+			.setDesc(this.plugin.isFirstSyncComplete ? copy.startupHelp : copy.firstSyncRequired)
 			.addToggle((toggle) => toggle
 				.setValue(this.plugin.settingsView.syncOnStartup)
 				.setDisabled(this.plugin.isBusy || !this.plugin.isFirstSyncComplete)
@@ -755,8 +789,8 @@ class QuarkSettingsTab extends PluginSettingTab {
 
 		let intervalInput!: TextComponent;
 		new Setting(containerEl)
-			.setName('自动同步间隔（分钟）')
-			.setDesc('默认 5 分钟，可设为 1 至 1440 分钟。')
+			.setName(copy.interval)
+			.setDesc(copy.intervalHelp)
 			.addText((text) => {
 				intervalInput = text;
 				text.inputEl.type = 'number';
@@ -766,36 +800,36 @@ class QuarkSettingsTab extends PluginSettingTab {
 				text.setDisabled(this.plugin.isBusy);
 			})
 			.addButton((button) => button
-				.setButtonText('保存')
+				.setButtonText(copy.save)
 				.setDisabled(this.plugin.isBusy)
 				.onClick(() => void this.plugin.setAutoSyncInterval(Number(intervalInput.getValue()))));
 
 		new Setting(containerEl)
-			.setName('同步操作')
-			.setDesc('预览始终只读；首次同步需要查看预览并再次确认。')
+			.setName(copy.sync)
+			.setDesc(copy.syncHelp)
 			.addButton((button) => button
-				.setButtonText('预览同步变化')
+				.setButtonText(copy.preview)
 				.setDisabled(this.plugin.isBusy)
 				.onClick(() => void this.plugin.previewSync()))
 			.addButton((button) => button
-				.setButtonText('立即同步夸克')
+				.setButtonText(copy.syncNow)
 				.setCta()
 				.setDisabled(this.plugin.isBusy)
 				.onClick(() => void this.plugin.requestSync()));
 
 		new Setting(containerEl)
-			.setName('上次同步详情')
-			.setDesc(last ? `跳过路径：${last.skipped.length}` : '还没有同步记录。')
+			.setName(copy.details)
+			.setDesc(last ? (language === 'en' ? `Skipped paths: ${last.skipped.length}` : `跳过路径：${last.skipped.length}`) : copy.emptyDetails)
 			.addButton((button) => button
-				.setButtonText('查看状态与跳过路径')
+				.setButtonText(copy.viewDetails)
 				.setDisabled(this.plugin.isBusy || !last)
 				.onClick(() => this.plugin.showLastSummary()));
 
 		new Setting(containerEl)
-			.setName('连接检查')
-			.setDesc('只读取夸克账号和根目录列表，不创建或修改云端文件。')
+			.setName(copy.connection)
+			.setDesc(copy.connectionHelp)
 			.addButton((button) => button
-				.setButtonText('检查夸克连接')
+				.setButtonText(copy.checkConnection)
 				.setDisabled(this.plugin.isBusy)
 				.onClick(() => void this.plugin.checkConnection()));
 	}
@@ -808,27 +842,28 @@ class QuarkSettingsTab extends PluginSettingTab {
 		const section = this.accountSection;
 		if (!section) return;
 		section.empty();
+		const copy = settingsText[this.plugin.settingsView.language];
 		const account = this.plugin.accountView;
-		const row = new Setting(section).setName('夸克账号');
+		const row = new Setting(section).setName(copy.account);
 		if (account.state === 'connected') {
-			row.setDesc('已登录 · ' + account.label);
+			row.setDesc(copy.signedIn + account.label);
 			if (Platform.isDesktopApp && !Platform.isMobileApp) {
 				row.addButton((button) => button
-					.setButtonText('导出到手机')
+					.setButtonText(copy.exportAuthorization)
 					.setDisabled(this.plugin.isBusy)
 					.onClick(() => new ExportPairingModal(this.app, this.plugin).open()));
 			}
 		} else {
-			row.setDesc(account.state === 'expired' ? '登录已失效，请重新授权。' : '此设备尚未连接夸克账号。');
+			row.setDesc(account.state === 'expired' ? copy.expired : copy.signedOut);
 			if (Platform.isDesktopApp && !Platform.isMobileApp) {
 				row.addButton((button) => button
-					.setButtonText('扫码登录')
+					.setButtonText(copy.qrSignIn)
 					.setCta()
 					.setDisabled(this.plugin.isBusy)
 					.onClick(() => this.plugin.openQrLogin()));
 			} else if (Platform.isMobileApp) {
 				row.addButton((button) => button
-					.setButtonText('导入电脑授权')
+					.setButtonText(copy.importAuthorization)
 					.setCta()
 					.setDisabled(this.plugin.isBusy)
 					.onClick(() => new ImportPairingModal(this.app, this.plugin).open()));
@@ -836,7 +871,7 @@ class QuarkSettingsTab extends PluginSettingTab {
 		}
 		if (account.state !== 'signed-out') {
 			row.addButton((button) => button
-				.setButtonText('退出登录')
+				.setButtonText(copy.signOut)
 				.setDisabled(this.plugin.isBusy)
 				.onClick(() => this.plugin.signOut()));
 		}
@@ -1180,6 +1215,7 @@ function normalizeSettings(data: PersistedData): PluginSettings {
 		? Math.min(1440, Math.max(1, Math.floor(data.autoSyncIntervalMinutes)))
 		: DEFAULT_AUTO_SYNC_MINUTES;
 	return {
+		language: data.language === 'en' ? 'en' : 'zh-CN',
 		cloudDirectoryName: directory,
 		deviceName,
 		autoSync: data.autoSync === true && data.initialSyncCompleted === true,

@@ -18,17 +18,19 @@ The plugin uses Quark Drive's unofficial web API. Changes to that API or to acco
 
 1. Download the ZIP from [GitHub Releases](https://github.com/18030838922/quark-note-sync/releases/latest) and extract it.
 2. Copy the extracted `quark-note-sync` folder into `<vault>/.obsidian/plugins/`. Its `manifest.json` and `main.js` should sit directly inside that folder. On Android, use the folder for the vault Obsidian has actually opened. Your file manager may need to show hidden files.
-3. In Obsidian Settings → Community plugins, turn off Restricted mode if needed and enable **夸克笔记同步**.
+3. In Obsidian Settings → Community plugins, turn off Restricted mode if needed and enable the newly installed plugin.
 
 Requires Obsidian 1.11.4 or later. To update a manual installation, replace `manifest.json` and `main.js`, keep any existing `data.json`, and reload Obsidian.
 
 ## Set up sync
 
-1. On Windows, open Settings → **夸克笔记同步**. Select **扫码登录** and scan the QR code with the Quark app. The plugin verifies the account and drive access before saving the session.
+The plugin settings default to Simplified Chinese. Open the plugin’s settings and select **English** in the language dropdown at the top of the page.
+
+1. On Windows, select **Sign in with QR code** and scan the QR code with the Quark app. The plugin verifies the account and drive access before saving the session.
 2. Set a dedicated top-level Quark Drive folder for this vault. Use the same folder on both devices and a separate folder for every other vault.
-3. Select **预览同步变化** to preview changes, then select **立即同步夸克** and confirm the first sync. This first sync can create the target folder if needed.
-4. Once the target folder exists, select **导出到手机** on Windows and set a password of at least 12 characters. On Android, select **导入电脑授权**, paste the code, and enter the same password. A code expires after 15 minutes. Import validates the account and target folder. Complete the first sync on Android separately.
-5. Once the first sync is complete on a device, you can enable **打开 Obsidian 时同步** or **自动同步** in its plugin settings.
+3. Select **Preview sync changes** to preview changes, then select **Sync now** and confirm the first sync. This first sync can create the target folder if needed.
+4. Once the target folder exists, select **Export to phone** on Windows and set a password of at least 12 characters. On Android, select **Import desktop authorization**, paste the code, and enter the same password. A code expires after 15 minutes. Import validates the account and target folder. Complete the first sync on Android separately.
+5. Once the first sync is complete on a device, you can enable **Sync when Obsidian opens** or **Periodic sync** in its plugin settings.
 
 If a session expires, scan again on Windows or import a fresh authorization code on Android. Signing out clears the session on the current device and keeps its sync history. Advanced settings offer manual Cookie entry.
 

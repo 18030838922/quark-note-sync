@@ -1,6 +1,6 @@
 {
   "name": "quark-note-sync",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "private": true,
   "description": "Windows 和 Android 版 Obsidian 夸克网盘同步插件",
   "scripts": {
