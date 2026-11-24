@@ -108,3 +108,12 @@ test('preview classification distinguishes capped images and documents from medi
 	assert.equal(mimeTypeForFile('report.pdf'), 'application/pdf');
 	assert.equal(mimeTypeForFile('notes.md'), 'text/plain');
 });
+
+
+test('insertion follows changes outside the selection and preserves edits inside it', async () => {
+	const { mapInsertionRange } = await import('../src/quark-references.ts');
+	assert.deepEqual(mapInsertionRange('prefix selected suffix', 'new prefix selected suffix', 7, 15), [11, 19]);
+	assert.deepEqual(mapInsertionRange('prefix selected suffix', 'prefix selected suffix edited', 7, 15), [7, 15]);
+	assert.equal(mapInsertionRange('prefix selected suffix', 'prefix changed suffix', 7, 15), null);
+	assert.deepEqual(mapInsertionRange('before', 'before', 6, 6), [6, 6]);
+});

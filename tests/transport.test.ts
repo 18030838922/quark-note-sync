@@ -223,3 +223,15 @@ test('desktop share preview checks declared and streamed lengths before bufferin
 		});
 	}
 });
+
+
+test('Quark signed download CDN is download-only and receives no drive session', () => {
+	for (const host of ['dl-c-sz-u.drive.quark.cn', 'dl-c-zb-u.drive.quark.cn']) {
+		const url = `https://${host}/opaque?ticket=fixture`;
+		assert.equal(classifyQuarkUrl(url, 'download'), 'quark-signed-download');
+		assert.deepEqual(createSafeHeaders(url, '__puus=fixture', { Cookie: 'override' }, 'download'), {});
+		assert.throws(() => classifyQuarkUrl(url, 'api'), /主机/);
+		assert.throws(() => classifyQuarkUrl(url, 'upload'), /主机/);
+	}
+	assert.throws(() => classifyQuarkUrl('https://dl-c-zb-u.drive.quark.cn.example.com/', 'download'), /主机/);
+});

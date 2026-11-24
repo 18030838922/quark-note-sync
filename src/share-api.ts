@@ -1,3 +1,4 @@
+import { selectQuarkVideoStream } from './video-stream-url.ts';
 import type { HttpRequester } from './quark-api.ts';
 import type { HttpRequest, HttpResponse } from './transport.ts';
 import { classifyQuarkUrl } from './transport.ts';
@@ -114,6 +115,15 @@ export class QuarkShareClient {
 			if (list.length === 0) throw new ShareApiError('request');
 		}
 		throw new ShareApiError('request');
+	}
+
+	async getVideoStream(session: ShareSession, entry: ShareEntry): Promise<string> {
+		const validSession = requireSession(session);
+		const file = requireFileEntry(entry);
+		const body = await this.requestJson(`${SHARE_API}/video_preview`, 'GET', {
+			pwd_id: validSession.pwdId, stoken: validSession.stoken, fid: file.fid, fid_token: file.fidToken,
+		});
+		return selectQuarkVideoStream(body.data);
 	}
 
 	async previewDocumentOrImage(session: ShareSession, entry: ShareEntry): Promise<ShareBytes> {
@@ -362,7 +372,7 @@ function isRasterImage(name: string): boolean {
 	return /\.(?:png|jpe?g|gif|webp|bmp|tiff?|heic|heif|avif)$/i.test(name);
 }
 
-function sniffPayloadMime(bytes: Uint8Array): string | undefined {
+export function sniffPayloadMime(bytes: Uint8Array): string | undefined {
 	if (startsWith(bytes, [0x25, 0x50, 0x44, 0x46, 0x2d])) return 'application/pdf';
 	if (startsWith(bytes, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) return 'image/png';
 	if (startsWith(bytes, [0xff, 0xd8, 0xff])) return 'image/jpeg';

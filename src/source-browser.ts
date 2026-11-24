@@ -1,3 +1,4 @@
+import { mountQuarkVideo, type VideoStream } from './video-stream.ts';
 import { ItemView, Notice, type WorkspaceLeaf } from 'obsidian';
 import type { RemoteFile } from './quark-api.ts';
 import { parseOfficialShareUrl, previewKindForFile, type PreviewKind } from './quark-references.ts';
@@ -19,6 +20,7 @@ export interface SourceEditorTarget {
 }
 
 export interface PreviewPayload {
+	stream?: VideoStream;
 	name: string;
 	kind: PreviewKind;
 	bytes?: Uint8Array;
@@ -379,6 +381,7 @@ export class QuarkBrowserView extends ItemView {
 
 export class QuarkPreviewView extends ItemView {
 	private payload: PreviewPayload | undefined;
+	private stopVideo?: () => void;
 	private objectUrl: string | undefined;
 	private readonly getLanguage: () => 'zh-CN' | 'en';
 
@@ -401,6 +404,7 @@ export class QuarkPreviewView extends ItemView {
 	}
 
 	async setState(_state: Record<string, unknown>): Promise<void> {
+		this.revokeObjectUrl();
 		this.payload = undefined;
 		this.render();
 	}
@@ -439,6 +443,10 @@ export class QuarkPreviewView extends ItemView {
 		}
 		this.contentEl.createEl('p', { cls: 'quark-preview-title', text: payload.name });
 		if (payload.message) this.contentEl.createEl('p', { text: payload.message });
+		if (payload.stream) {
+			this.stopVideo = mountQuarkVideo(this.contentEl, payload.stream);
+			return;
+		}
 		if (payload.kind === 'unsupported') {
 			if (payload.download) {
 				this.addPreviewButton(this.contentEl, this.label('下载到夸克下载', 'Download to Quark Downloads'), () => void payload.download?.());
@@ -486,6 +494,8 @@ export class QuarkPreviewView extends ItemView {
 	}
 
 	private revokeObjectUrl(): void {
+		this.stopVideo?.();
+		this.stopVideo = undefined;
 		if (!this.objectUrl) return;
 		URL.revokeObjectURL(this.objectUrl);
 		this.objectUrl = undefined;

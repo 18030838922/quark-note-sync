@@ -183,3 +183,38 @@ export function mimeTypeForFile(name: string): string {
 	};
 	return mimeTypes[extension] ?? 'application/octet-stream';
 }
+
+
+export function isInlineMediaName(name: string): boolean {
+	const { kind } = previewKindForFile(name.trim());
+	return kind === 'image' || kind === 'audio' || kind === 'video';
+}
+
+/** Map a selection through one contiguous change, retaining edits outside it. */
+export function mapInsertionRange(before: string, after: string, from: number, to: number): [number, number] | null {
+	if (before === after) return [from, to];
+	let start = 0;
+	while (start < before.length && start < after.length && before[start] === after[start]) start++;
+	let end = before.length;
+	let newEnd = after.length;
+	while (end > start && newEnd > start && before[end - 1] === after[newEnd - 1]) {
+		end--;
+		newEnd--;
+	}
+	if (end <= from) return [from + newEnd - end, to + newEnd - end];
+	if (start >= to) return [from, to];
+	return null;
+}
+
+export function loadWhenVisible(element: HTMLElement, load: () => void): () => void {
+	const Observer = element.ownerDocument.defaultView?.IntersectionObserver;
+	if (!Observer) return () => {};
+	const observer = new Observer((entries) => {
+		if (entries.some((entry) => entry.isIntersecting)) {
+			observer.disconnect();
+			if (element.isConnected) load();
+		}
+	});
+	observer.observe(element);
+	return () => observer.disconnect();
+}

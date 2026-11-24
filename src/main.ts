@@ -1,3 +1,4 @@
+import { mountQuarkVideo } from './video-stream.ts';
 import { hasAsciiControl } from './core.ts';
 import {
 	Modal,
@@ -28,7 +29,7 @@ import { settingsText, type Language } from './settings-text.ts';
 import { DASHBOARD_VIEW_TYPE, QuarkDashboardSidebar, type QuarkDashboardActions, type QuarkDashboardView } from './dashboard.ts';
 import { summarizeVaultFiles } from './dashboard-stats.ts';
 import { addSourceIndexEntry, chooseDownloadPath, managedDownloadPaths, moveSourceIndexPath, normalizeSourceIndex, QUARK_DOWNLOADS_DIRECTORY, sourceIndexKey, type SourceIndex, type SourceIndexEntry } from './source-index.ts';
-import { accountReferenceKey, findOfficialShareUrl, formatPersonalReference, formatPublicShareReference, MAX_PERSONAL_DOWNLOAD_BYTES, mimeTypeForFile, parseOfficialShareUrl, parsePersonalReference, previewKindForFile, type PreviewKind } from './quark-references.ts';
+import { accountReferenceKey, findOfficialShareUrl, formatPersonalReference, formatPublicShareReference, MAX_PERSONAL_DOWNLOAD_BYTES, isInlineMediaName, loadWhenVisible, mapInsertionRange, mimeTypeForFile, parseOfficialShareUrl, parsePersonalReference, previewKindForFile, type PersonalReference, type PreviewKind } from './quark-references.ts';
 import {
 	QUARK_BROWSER_VIEW_TYPE,
 	QUARK_PREVIEW_VIEW_TYPE,
@@ -91,6 +92,7 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 	private autoSyncTimer: number | undefined;
 	private credentialId = '';
 	private credentialRevision = 0;
+	private inlineMediaQueue: Promise<void> = Promise.resolve();
 	private startupSyncPending = true;
 	private layoutReady = false;
 	private accountNickname: string | undefined;
@@ -118,6 +120,7 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		this.registerView(QUARK_PREVIEW_VIEW_TYPE, (leaf) => new QuarkPreviewView(leaf, () => this.config.language));
 		this.registerEditorExtension(createReferenceLivePreview({
 			language: () => this.config.language,
+			loadMedia: (reference, visible) => this.loadVisiblePersonalMedia(reference, visible),
 			openReference: async (reference, showMedia) => await this.openPersonalReference({
 				account: reference.accountKey,
 				fid: reference.fid,
@@ -168,26 +171,41 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 					anchor.title = this.config.language === 'en'
 						? 'Open Quark file; images and audio/video load inline on demand'
 						: '打开夸克文件；图片和音视频会按需内嵌加载';
+					let rendered = false;
+					const show = (payload: PreviewPayload) => {
+						if (rendered || !anchor.isConnected) return;
+						const media = createInlineMedia(payload, inlineMedia);
+						if (!media) return;
+						rendered = true;
+						anchor.after(media);
+					};
 					inlineMedia.onClick(anchor, (event) => {
 						event.preventDefault();
 						event.stopPropagation();
-						void this.openPersonalReference({ account: reference.accountKey, fid: reference.fid }, (payload) => {
-							const media = createInlineMedia(payload, inlineMedia);
-						if (media && anchor.isConnected) anchor.after(media);
-						});
+						if (!rendered) void this.openPersonalReference({ account: reference.accountKey, fid: reference.fid }, show);
 					});
+					if (isInlineMediaName(anchor.textContent ?? '')) {
+						inlineMedia.whenVisible(anchor, () => void this.loadVisiblePersonalMedia(reference, () => anchor.isConnected && !rendered).then((payload) => {
+							if (payload) show(payload);
+						}).catch(() => {}));
+					}
 				}
 			}
 			for (const image of Array.from(element.querySelectorAll<HTMLImageElement>('img[src]'))) {
 				const reference = parsePersonalReference(image.getAttribute('src') ?? image.src);
 				if (!reference || image.dataset.quarkShareHandler === '1') continue;
 				image.dataset.quarkShareHandler = '1';
-				const button = document.createElement('button');
+				const button = element.ownerDocument.createElement('button');
 				button.type = 'button';
 				button.className = 'quark-inline-load-button';
 				button.textContent = this.config.language === 'en' ? `Load ${image.alt || 'Quark image'}` : `加载${image.alt || '夸克图片'}`;
 				button.setAttribute('aria-label', button.textContent);
 				image.replaceWith(button);
+				inlineMedia.whenVisible(button, () => void this.loadVisiblePersonalMedia(reference, () => button.isConnected).then((payload) => {
+					if (!payload || !button.isConnected) return;
+					const media = createInlineMedia(payload, inlineMedia);
+					if (media) button.replaceWith(media);
+				}).catch(() => {}));
 				inlineMedia.onClick(button, (event) => {
 					event.preventDefault();
 					button.disabled = true;
@@ -302,6 +320,14 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 				const file = share.selectedFid
 					? entries.find((entry) => entry.fid === share.selectedFid)
 					: entries.length === 1 ? entries[0] : undefined;
+				if (file && !file.isDirectory && previewKindForFile(file.name).kind === 'video') {
+					const url = await client.getVideoStream(session, file);
+					if (!this.unloading) showInlineMedia({
+						name: file.name, kind: 'video',
+						stream: { url, transport: this.createTransport(), language: this.config.language, officialUrl: share.officialUrl },
+					});
+					return;
+				}
 				if (file && !file.isDirectory && previewKindForFile(file.name).kind === 'image') {
 					const payload = await client.previewDocumentOrImage(session, file);
 					if (!this.unloading) showInlineMedia(createPreviewPayload(file.name, 'image', payload.bytes, payload.mimeType));
@@ -342,15 +368,21 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		const sourceView = info?.editor === editor ? info as MarkdownView : active;
 		const path = info?.file?.path ?? sourceView?.file?.path;
 		if (!sourceView || !path || sourceView.file?.path !== path) return undefined;
-		const originalText = editor.getValue();
-		const anchor = editor.getCursor('from');
-		const head = editor.getCursor('to');
+		let originalText = editor.getValue();
+		let from = editor.posToOffset(editor.getCursor('from'));
+		let to = editor.posToOffset(editor.getCursor('to'));
 		return {
 			insert: (markdown) => {
-				if (sourceView.file?.path !== path || editor.getValue() !== originalText) return false;
-				editor.setSelection(anchor, head);
-				editor.replaceSelection(markdown);
-				editor.focus();
+				if (sourceView.file?.path !== path || sourceView.editor !== editor) return false;
+				const currentText = editor.getValue();
+				const mapped = mapInsertionRange(originalText, currentText, from, to);
+				if (!mapped) return false;
+				const [start, end] = mapped;
+				const separator = start > 0 && !/\s/.test(currentText[start - 1]) ? ' ' : '';
+				const inserted = separator + markdown;
+				editor.replaceRange(inserted, editor.offsetToPos(start), editor.offsetToPos(end));
+				from = to = start + inserted.length;
+				originalText = editor.getValue();
 				return true;
 			},
 		};
@@ -374,7 +406,7 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 
 	private async previewPersonalFile(file: RemoteFile, _parentFid: string, target?: SourceEditorTarget): Promise<void> {
 		const preview = previewKindForFile(file.name);
-		if (preview.kind === 'unsupported' || file.size > preview.maxBytes) {
+		if (preview.kind === 'unsupported' || (preview.kind !== 'video' && file.size > preview.maxBytes)) {
 			await this.openPreviewTab({
 				name: file.name,
 				kind: 'unsupported',
@@ -387,12 +419,20 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		}
 		await this.runExclusive(this.config.language === 'en' ? 'Preview Quark file' : '预览夸克文件', async () => {
 			const client = this.createClient(this.requireCookie());
-			const bytes = await client.downloadFile(file, preview.maxBytes);
-			await this.openPreviewTab(createPreviewPayload(file.name, preview.kind, bytes, mimeTypeForFile(file.name)));
+			await this.openPreviewTab(await this.readPersonalPreview(client, file, preview.kind, preview.maxBytes));
 		}, true);
 	}
 
 	private async previewShareFile(session: ShareSessionLike, file: ShareEntryLike, officialUrl: string): Promise<void> {
+		if (previewKindForFile(file.name).kind === 'video') {
+			try {
+				const url = await this.createShareClient().getVideoStream(session, file);
+				await this.openPreviewTab({ name: file.name, kind: 'video', stream: { url, transport: this.createTransport(), language: this.config.language, officialUrl } });
+				return;
+			} catch {
+				// The original share is still available for playback in Quark.
+			}
+		}
 		if (previewKindForFile(file.name).kind === 'image' || /\.pdf$/i.test(file.name)) {
 			try {
 				const result = await this.createShareClient().previewDocumentOrImage(session, file);
@@ -554,6 +594,31 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		});
 	}
 
+	private loadVisiblePersonalMedia(reference: PersonalReference, visible: () => boolean): Promise<PreviewPayload | undefined> {
+		const task = this.inlineMediaQueue.then(async () => {
+			if (this.unloading || !visible()) return;
+			const cached = this.findIndexedSource(reference.accountKey, reference.fid);
+			let payload: PreviewPayload | undefined;
+			if (cached && isInlineMediaName(cached.name) && await this.previewCachedSource(cached, (result) => { payload = result; }, true)) return payload;
+			const cookie = this.readCookie();
+			if (!cookie || this.config.sessionExpired) return;
+			const revision = this.credentialRevision;
+			const client = this.createClient(cookie);
+			const accountId = await client.checkConnection();
+			if (!accountId || await accountReferenceKey(accountId) !== reference.accountKey ||
+				revision !== this.credentialRevision || !visible()) return;
+			const file = await client.getFileById(reference.fid);
+			const { kind, maxBytes } = previewKindForFile(file.name);
+			if (file.isDirectory || !isInlineMediaName(file.name) || (kind !== 'video' && file.size > maxBytes) || !visible()) return;
+			const onlinePayload = await this.readPersonalPreview(client, file, kind, maxBytes);
+			if (!this.unloading && revision === this.credentialRevision && visible()) {
+				return onlinePayload;
+			}
+		});
+		this.inlineMediaQueue = task.then(() => {}, () => {});
+		return task;
+	}
+
 	private async openPersonalReference(
 		params: Record<string, string>,
 		showInlineMedia?: (payload: PreviewPayload) => void,
@@ -607,7 +672,7 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		showInlineMedia?: (payload: PreviewPayload) => void,
 	): Promise<void> {
 		const preview = previewKindForFile(file.name);
-		if (preview.kind === 'unsupported' || file.size > preview.maxBytes) {
+		if (preview.kind === 'unsupported' || (preview.kind !== 'video' && file.size > preview.maxBytes)) {
 			await this.openPreviewTab({
 				name: file.name,
 				kind: 'unsupported',
@@ -619,8 +684,7 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 			return;
 		}
 		try {
-			const bytes = await client.downloadFile(file, preview.maxBytes);
-			const payload = createPreviewPayload(file.name, preview.kind, bytes, mimeTypeForFile(file.name));
+			const payload = await this.readPersonalPreview(client, file, preview.kind, preview.maxBytes);
 			if (showInlineMedia && (preview.kind === 'image' || preview.kind === 'audio' || preview.kind === 'video')) showInlineMedia(payload);
 			else await this.openPreviewTab(payload);
 		} catch (error) {
@@ -629,18 +693,47 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		}
 	}
 
+	private async readPersonalPreview(client: QuarkClient, file: RemoteFile, kind: PreviewKind, maxBytes: number): Promise<PreviewPayload> {
+		if (kind === 'video') {
+			try {
+				const url = await client.getVideoStream(file);
+				const revision = this.credentialRevision;
+				return {
+					name: file.name, kind, stream: {
+						url, language: this.config.language, officialUrl: 'https://pan.quark.cn/',
+						transport: { request: async (request) => {
+							if (this.unloading || revision !== this.credentialRevision || this.config.sessionExpired) {
+								throw new Error('夸克播放会话已变化');
+							}
+							return await client.requestVideoSegment(request);
+						} },
+					},
+				};
+			} catch (error) {
+				if (error instanceof QuarkAuthenticationError || file.size > maxBytes) throw error;
+			}
+		}
+		if (kind === 'image') {
+			const { bytes, mimeType } = await client.previewImage(file, maxBytes);
+			return createPreviewPayload(file.name, kind, bytes, mimeType);
+		}
+		const bytes = await client.downloadFile(file, maxBytes);
+		return createPreviewPayload(file.name, kind, bytes, mimeTypeForFile(file.name));
+	}
+
 	private findIndexedSource(accountKey: string, fid: string): SourceIndexEntry | undefined {
 		return Object.values(this.config.sourceIndex)
 			.filter((entry) => entry.accountKey === accountKey && entry.fid === fid)
 			.sort((left, right) => right.downloadedAt - left.downloadedAt)[0];
 	}
 
-	private async previewCachedSource(source: SourceIndexEntry, showInlineMedia?: (payload: PreviewPayload) => void): Promise<boolean> {
+	private async previewCachedSource(source: SourceIndexEntry, showInlineMedia?: (payload: PreviewPayload) => void, inlineOnly = false): Promise<boolean> {
 		try {
 			const file = this.app.vault.getFileByPath(source.localPath);
 			if (!file) return false;
 			const preview = previewKindForFile(source.name);
 			if (preview.kind === 'unsupported' || file.stat.size > preview.maxBytes) {
+				if (inlineOnly) return false;
 				await this.openPreviewTab({
 					name: source.name,
 					kind: 'unsupported',
@@ -2191,8 +2284,16 @@ class QuarkInlineMediaChild extends MarkdownRenderChild {
 	private readonly objectUrls = new Set<string>();
 	private readonly listeners: Array<() => void> = [];
 
+	trackCleanup(cleanup: () => void): void {
+		this.listeners.push(cleanup);
+	}
+
 	trackObjectUrl(url: string): void {
 		this.objectUrls.add(url);
+	}
+
+	whenVisible(element: HTMLElement, load: () => void): void {
+		this.listeners.push(loadWhenVisible(element, load));
 	}
 
 	onClick(element: HTMLElement, callback: (event: MouseEvent) => void): void {
@@ -2209,6 +2310,12 @@ class QuarkInlineMediaChild extends MarkdownRenderChild {
 }
 
 function createInlineMedia(payload: PreviewPayload, owner: QuarkInlineMediaChild): HTMLElement | undefined {
+	if (payload.stream) {
+		const container = owner.containerEl.ownerDocument.createElement('span');
+		container.className = 'quark-live-reference';
+		owner.trackCleanup(mountQuarkVideo(container, payload.stream));
+		return container;
+	}
 	if (!payload.bytes || !payload.mimeType || !['image', 'audio', 'video'].includes(payload.kind)) return undefined;
 	const buffer = payload.bytes.buffer.slice(payload.bytes.byteOffset, payload.bytes.byteOffset + payload.bytes.byteLength) as ArrayBuffer;
 	const url = URL.createObjectURL(new Blob([buffer], { type: payload.mimeType }));

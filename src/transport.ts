@@ -5,7 +5,7 @@ const COOKIE_API_HOSTS = new Set(['drive-pc.quark.cn', 'drive.quark.cn', 'pan.qu
 
 export type QuarkHostKind = 'authenticated-api' | 'quark-transfer';
 export type ResponseKind = 'text' | 'arraybuffer';
-export type RequestPurpose = 'api' | 'download' | 'upload' | 'login' | 'share-api' | 'share-preview';
+export type RequestPurpose = 'api' | 'download' | 'upload' | 'login' | 'share-api' | 'share-preview' | 'image-preview' | 'video-stream' | 'private-video-stream';
 
 export interface HttpRequest {
 	url: string;
@@ -16,6 +16,7 @@ export interface HttpRequest {
 	responseKind?: ResponseKind;
 	purpose?: RequestPurpose;
 	maxResponseBytes?: number;
+	signal?: AbortSignal;
 }
 
 export interface HttpResponse {
@@ -36,7 +37,7 @@ export class QuarkTransportError extends Error {
 export function classifyQuarkUrl(
 	input: string,
 	purpose: RequestPurpose = 'api',
-): QuarkHostKind | 'quark-download' | 'oss-upload' | 'quark-login' | 'quark-share-api' | 'quark-share-preview' {
+): QuarkHostKind | 'quark-download' | 'oss-upload' | 'quark-login' | 'quark-signed-download' | 'quark-video-stream' | 'quark-share-api' | 'quark-share-preview' {
 	let url: URL;
 	try {
 		url = new URL(input);
@@ -58,13 +59,23 @@ export function classifyQuarkUrl(
 	} else if (purpose === 'download') {
 		if (COOKIE_API_HOSTS.has(url.hostname)) return 'authenticated-api';
 		if (url.hostname.endsWith('.pds.quark.cn')) return 'quark-download';
+		if (/^dl-(?:[a-z0-9]+-){1,4}[a-z0-9]+\.drive\.quark\.cn$/.test(url.hostname)) return 'quark-signed-download';
+		throw new QuarkTransportError(`夸克下载主机不在允许列表（${url.hostname}）`);
 	} else if (purpose === 'share-api') {
 		if (url.hostname === 'pan.quark.cn' && [
 			'/1/clouddrive/share/sharepage/token',
 			'/1/clouddrive/share/sharepage/detail',
 			'/1/clouddrive/share/sharepage/preview',
 			'/1/clouddrive/share/sharepage/pdf_preview',
+			'/1/clouddrive/share/sharepage/video_preview',
 		].includes(url.pathname)) return 'quark-share-api';
+	} else if (purpose === 'private-video-stream') {
+		if (/^video-h-fkad-[a-z0-9]{2,8}\.drive\.quark\.cn$/.test(url.hostname)) return 'quark-video-stream';
+	} else if (purpose === 'video-stream') {
+		if (/^video-play(?:-[a-z0-9]+){1,8}\.drive\.quark\.cn$/.test(url.hostname) ||
+			/^video-h-fkad-[a-z0-9]{2,8}\.drive\.quark\.cn$/.test(url.hostname)) return 'quark-video-stream';
+	} else if (purpose === 'image-preview') {
+		if (/^img-view-[a-z0-9]+(?:-[a-z0-9]+){1,3}\.drive\.quark\.cn$/.test(url.hostname)) return 'quark-share-preview';
 	} else if (purpose === 'share-preview') {
 		if ([
 			'img-view-c-zb.drive.quark.cn',
@@ -88,7 +99,7 @@ export function createSafeHeaders(
 	for (const [name, value] of Object.entries(extra)) {
 		if (name.toLowerCase() !== 'cookie') headers[name] = value;
 	}
-	if ((kind === 'authenticated-api' || kind === 'quark-download') && cookie && purpose !== 'upload' && purpose !== 'login') {
+	if ((kind === 'authenticated-api' || kind === 'quark-download' || (kind === 'quark-video-stream' && purpose === 'private-video-stream')) && cookie && purpose !== 'upload' && purpose !== 'login') {
 		if (/[\r\n]/.test(cookie)) throw new QuarkTransportError('Cookie 格式无效');
 		headers.Cookie = cookie;
 	}
@@ -112,7 +123,7 @@ export class QuarkTransport {
 		}
 		classifyQuarkUrl(request.url, request.purpose);
 		if (request.purpose === 'share-api') assertShareApiMethod(request.url, request.method);
-		if (request.purpose === 'share-preview' && request.method !== 'GET') {
+		if ((request.purpose === 'share-preview' || request.purpose === 'image-preview' || request.purpose === 'video-stream' || request.purpose === 'private-video-stream') && request.method !== 'GET') {
 			throw new QuarkTransportError('夸克分享预览只允许固定的 GET 请求');
 		}
 		const maxResponseBytes = validateMaxResponseBytes(request.maxResponseBytes);
@@ -193,6 +204,7 @@ export class QuarkTransport {
 				method: request.method,
 				headers,
 				timeout: 60000,
+				signal: request.signal,
 			}, (incoming: IncomingMessage) => {
 				try {
 					assertDeclaredLengthWithinLimit(normalizeHeaders(incoming.headers), maxResponseBytes);
@@ -245,6 +257,7 @@ function assertShareApiMethod(input: string, method: string): void {
 		'/1/clouddrive/share/sharepage/detail': 'GET',
 		'/1/clouddrive/share/sharepage/preview': 'GET',
 		'/1/clouddrive/share/sharepage/pdf_preview': 'GET',
+		'/1/clouddrive/share/sharepage/video_preview': 'GET',
 	};
 	if (expectedMethod[url.pathname] !== method) {
 		throw new QuarkTransportError('夸克分享接口只允许已验证的固定请求方式');

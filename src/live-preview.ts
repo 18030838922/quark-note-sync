@@ -1,12 +1,14 @@
+import { mountQuarkVideo } from './video-stream.ts';
 import { editorLivePreviewField } from 'obsidian';
 import type { Extension } from '@codemirror/state';
 import { Decoration, ViewPlugin, WidgetType, type DecorationSet, type EditorView, type ViewUpdate } from '@codemirror/view';
-import { findOfficialShareLinks, findPersonalReferenceLinks, type OfficialShareLinkRange, type PersonalReference, type PersonalReferenceLinkRange } from './quark-references.ts';
+import { findOfficialShareLinks, findPersonalReferenceLinks, isInlineMediaName, loadWhenVisible, type OfficialShareLinkRange, type PersonalReference, type PersonalReferenceLinkRange } from './quark-references.ts';
 import type { PreviewPayload } from './source-browser.ts';
 
 type ReferenceRange = PersonalReferenceLinkRange | OfficialShareLinkRange;
 
 export interface ReferenceLivePreviewOptions {
+	loadMedia(reference: PersonalReference, visible: () => boolean): Promise<PreviewPayload | undefined>;
 	language(): 'zh-CN' | 'en';
 	openReference(reference: PersonalReference, showMedia: (payload: PreviewPayload) => void): Promise<void>;
 	openShare(rawUrl: string, showMedia: (payload: PreviewPayload) => void): Promise<void>;
@@ -16,6 +18,8 @@ export interface ReferenceLivePreviewOptions {
 export function createReferenceLivePreview(options: ReferenceLivePreviewOptions): Extension {
 	class ReferenceWidget extends WidgetType {
 		private objectUrl: string | undefined;
+		private stopObserving?: () => void;
+		private stopVideo?: () => void;
 
 		constructor(
 			private readonly range: ReferenceRange,
@@ -53,6 +57,14 @@ export function createReferenceLivePreview(options: ReferenceLivePreviewOptions)
 				});
 			});
 			root.append(button);
+			if (!('rawUrl' in this.range) && (this.range.embedded || isInlineMediaName(this.range.label))) {
+				const { reference } = this.range;
+				this.stopObserving = loadWhenVisible(root, () => {
+					void this.actions.loadMedia(reference, () => root.isConnected && button.isConnected && !button.disabled).then((payload) => {
+						if (payload && root.isConnected && button.isConnected && !button.disabled) this.renderMedia(root, payload, view);
+					}).catch(() => {});
+				});
+			}
 			return root;
 		}
 
@@ -68,11 +80,19 @@ export function createReferenceLivePreview(options: ReferenceLivePreviewOptions)
 		}
 
 		destroy(): void {
+			this.stopObserving?.();
+			this.stopVideo?.();
 			if (this.objectUrl) URL.revokeObjectURL(this.objectUrl);
 			this.objectUrl = undefined;
 		}
 
 		private renderMedia(root: HTMLElement, payload: PreviewPayload, view: EditorView): void {
+			if (payload.stream) {
+				root.replaceChildren();
+				this.stopVideo = mountQuarkVideo(root, payload.stream);
+				view.requestMeasure();
+				return;
+			}
 			if (!payload.bytes || !payload.mimeType || !['image', 'audio', 'video'].includes(payload.kind)) return;
 			if (this.objectUrl) URL.revokeObjectURL(this.objectUrl);
 			const buffer = payload.bytes.buffer.slice(payload.bytes.byteOffset, payload.bytes.byteOffset + payload.bytes.byteLength) as ArrayBuffer;

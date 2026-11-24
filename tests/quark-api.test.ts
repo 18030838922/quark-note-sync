@@ -384,3 +384,26 @@ test('an explicit Quark access denial is reported without making another downloa
 	);
 	assert.equal(transport.requests.length, 2);
 });
+
+
+test('personal image preview uses the matching Quark web preview without downloading the original', async () => {
+	const previewUrl = 'https://img-view-c-zb.drive.quark.cn/preview';
+	const png = Uint8Array.of(137, 80, 78, 71, 13, 10, 26, 10);
+	const transport = new FixtureTransport((request, index) => {
+		if (index === 0) return response({ code: 0, data: [
+			{ fid: 'other', preview_url: 'https://img-view-c-zb.drive.quark.cn/other' },
+			{ fid: 'photo', preview_url: previewUrl },
+		] });
+		assert.equal(request.url, previewUrl);
+		assert.equal(request.cookie, undefined);
+		assert.equal(request.purpose, 'image-preview');
+		return { ...response(null), data: png };
+	});
+	const client = new QuarkClient(transport, 'sid=fixture');
+	const result = await client.previewImage({
+		fid: 'photo', name: 'Wallpaper.jpg', isDirectory: false, size: 9000, parentFid: 'folder', updatedAt: 10,
+	}, 10000);
+	assert.deepEqual(result, { bytes: png, mimeType: 'image/png' });
+	assert.equal(new URL(transport.requests[0].url).pathname, '/1/clouddrive/file/advanced_preview');
+	assert.equal(transport.requests.length, 2);
+});

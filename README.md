@@ -24,9 +24,11 @@ Vault usage comes from the file sizes Obsidian has indexed. The dashboard does n
 
 Right-click in a note and select **Insert Quark Drive file**. You can also run it from the command palette on desktop or mobile. Browse your drive, then choose **Insert link only** or **Download to vault and insert**. Both actions write the same Markdown link. The private link opens on another device after you sign in with the same Quark account.
 
-Images, audio, and video from your drive can render in Reading View and Live Preview. Select a document link to open its preview in a main workspace tab. PDF and plain-text files are supported. Previews load on demand and allow up to 20 MiB for images and documents and 50 MiB for audio and video. Playback depends on the codecs your device supports.
+In Reading View and Live Preview, personal images and audio load when their links come into view. For images, the plugin first tries Quark’s image preview, which can work when downloading the original fails. PDF and plain-text links open in a main workspace tab.
 
-You can also paste an official `pan.quark.cn` share URL or use Obsidian’s external link command. The preview tab can browse shared folders, prompt for a passcode, and display supported images and PDFs. When Quark restricts access to the original, open the share in Quark. This applies to shared audio, video, and other files for which the guest download is unavailable.
+For personal videos and supported public shares, select **Play from Quark** to stream the video in Obsidian. Streaming can play videos larger than 50 MiB and lets you seek while the player loads segments. Windows playback has been verified. Android and iOS/iPadOS playback still needs device testing. If the player or stream is unavailable, you can open Quark to watch.
+
+Paste an official `pan.quark.cn` share URL to browse shared folders, enter a passcode when required, and preview supported images, PDFs, and videos. Buffered previews are limited to 20 MiB for images and documents and 50 MiB for audio or video. Original-file downloads depend on Quark’s access rules.
 
 **Download to vault and insert** saves a local copy in `Quark Downloads/`. Personal downloads are capped at 100 MiB. The plugin uses that copy when available and syncs the note with its Quark link. It excludes files it downloaded and tracks from Quark sync, while ordinary attachments in the same folder remain eligible for sync. Save a copy to a regular attachment folder and link to it if you want to edit and sync the file itself.
 

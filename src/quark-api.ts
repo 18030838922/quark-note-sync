@@ -1,7 +1,9 @@
+import { selectQuarkVideoStream } from './video-stream-url.ts';
+import { sniffPayloadMime } from './share-api.ts';
 import { hasAsciiControl } from './core.ts';
 import { md5Base64, md5Hex, sha1Hex } from './hash.ts';
 import type { HttpRequest, HttpResponse } from './transport';
-import { QuarkTransportError } from './transport.ts';
+import { classifyQuarkUrl, QuarkTransportError } from './transport.ts';
 
 const DRIVE_ORIGIN = 'https://drive-pc.quark.cn';
 const DRIVE_API = `${DRIVE_ORIGIN}/1/clouddrive`;
@@ -15,6 +17,9 @@ export interface HttpRequester {
 }
 
 export interface RemoteFile {
+	parentFid?: string;
+	updatedAt?: number;
+	imagePreviewUrls?: string[];
 	fid: string;
 	name: string;
 	isDirectory: boolean;
@@ -321,18 +326,79 @@ export class QuarkClient {
 		return this.confirmUploaded(parentId, name, content.byteLength, preFid);
 	}
 
+	async getVideoStream(file: RemoteFile): Promise<string> {
+		const data = await this.requestApi(`${DRIVE_API}/file/v2/play`, 'POST', {}, {
+			fid: file.fid, resolutions: 'low', supports: 'fmp4,m3u8',
+		});
+		return selectQuarkVideoStream(data);
+	}
+
+	async requestVideoSegment(request: HttpRequest): Promise<HttpResponse> {
+		let purpose: HttpRequest['purpose'] = 'private-video-stream';
+		try {
+			classifyQuarkUrl(request.url, purpose);
+		} catch {
+			purpose = 'video-stream';
+		}
+		return await this.transport.request({
+			...request, purpose, cookie: purpose === 'private-video-stream' ? this.cookie : undefined,
+			headers: {
+				...request.headers,
+				Origin: 'https://pan.quark.cn',
+				Referer: 'https://pan.quark.cn/',
+				'User-Agent': QUARK_WEB_USER_AGENT,
+			},
+		});
+	}
+
+	async previewImage(file: RemoteFile, maxBytes: number): Promise<{ bytes: Uint8Array; mimeType: string }> {
+		const urls = new Set(file.imagePreviewUrls ?? []);
+		if (file.parentFid && file.updatedAt !== undefined) {
+			try {
+				const data = await this.requestApi(`${DRIVE_API}/file/advanced_preview`, 'GET', {
+					pdir_fid: file.parentFid, cat: 'image', _sort: 'updated_at:desc', _size: '15',
+					cur_fid: file.fid, cur_value: String(file.updatedAt), direction: 'after',
+				});
+				const rows = Array.isArray(data) ? data : asRecord(data).list;
+				if (Array.isArray(rows)) {
+					const row = rows.map(asRecord).find((entry) => String(entry.fid) === file.fid);
+					if (typeof row?.preview_url === 'string') urls.add(row.preview_url);
+				}
+			} catch (error) {
+				if (error instanceof QuarkAuthenticationError) throw error;
+			}
+		}
+		for (const url of [...urls].reverse()) {
+			try {
+				const response = await this.transport.request({
+					url, method: 'GET', purpose: 'image-preview', responseKind: 'arraybuffer', maxResponseBytes: maxBytes,
+				});
+				const mimeType = sniffPayloadMime(response.data);
+				if (response.status === 200 && response.data.byteLength <= maxBytes && mimeType?.startsWith('image/')) {
+					return { bytes: response.data, mimeType };
+				}
+			} catch {
+				// An expired or unsupported preview URL can fall back to the original.
+			}
+		}
+		const bytes = await this.downloadFile(file, maxBytes);
+		const mimeType = sniffPayloadMime(bytes);
+		if (!mimeType?.startsWith('image/')) throw new Error('夸克返回的内容不是受支持的图片');
+		return { bytes, mimeType };
+	}
+
 	async downloadFile(file: RemoteFile, maxBytes?: number): Promise<Uint8Array> {
 		if (maxBytes !== undefined && (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || file.size > maxBytes)) {
 			throw new Error(`夸克文件超过预览上限：${file.name}`);
 		}
-	let response = await this.requestDownload(file, maxBytes);
+		let response = await this.requestDownload(file, maxBytes);
 		let failure = response.status === 403 ? readDownloadFailure(response.data) : undefined;
 		if (response.status === 403 && (!failure || failure.retryable)) {
 			response = await this.requestDownload(file, maxBytes);
 			failure = response.status === 403 ? readDownloadFailure(response.data) : undefined;
 		}
 		if (response.status !== 200) {
-			const reason = failure ? '，' + failure.label : '';
+			const reason = failure ? '，' + failure.label : response.status === 412 ? '，可在夸克网页或客户端中尝试下载原文件' : '';
 			throw new Error(`夸克下载失败（HTTP ${response.status}${reason}）：${file.name}`);
 		}
 		if (response.data.byteLength !== file.size) throw new Error(`夸克下载长度不匹配：${file.name}`);
@@ -518,7 +584,17 @@ function normalizeRemoteFile(input: unknown): RemoteFile {
 	const type = record.file_type;
 	const isDirectory = record.dir === true || record.dir === 1 || type === 0 || type === '0' || type === 'folder';
 	const size = readNonNegativeNumber(record.size) ?? 0;
-	return { fid: String(fid), name, isDirectory, size };
+	const parent = record.pdir_fid;
+	const parentFid = typeof parent === 'string' && /^[\w-]{1,128}$/.test(parent) ? parent : parent === 0 ? '0' : undefined;
+	const updatedAt = readNonNegativeNumber(record.updated_at ?? record.l_updated_at);
+	const imagePreviewUrls = [record.thumbnail, record.big_thumbnail, record.preview_url]
+		.filter((value): value is string => typeof value === 'string' && value.startsWith('https://'));
+	return {
+		fid: String(fid), name, isDirectory, size,
+		...(parentFid !== undefined ? { parentFid } : {}),
+		...(updatedAt !== undefined ? { updatedAt } : {}),
+		...(imagePreviewUrls.length ? { imagePreviewUrls } : {}),
+	};
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
