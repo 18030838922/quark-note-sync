@@ -85,6 +85,15 @@ export function resolvePathEvents(events: VersionEvent[]): ResolvedPath {
 }
 
 /** Return a normalized relative vault path or reject paths that can escape or target local state. */
+/** Check ASCII control codes before using a value in a path, token or request header. */
+export function hasAsciiControl(value: string): boolean {
+	for (let index = 0; index < value.length; index += 1) {
+		const code = value.charCodeAt(index);
+		if (code < 32 || code === 127) return true;
+	}
+	return false;
+}
+
 export function validateVaultPath(input: string): string {
 	if (typeof input !== 'string' || input.length === 0 || input.startsWith('/') || input.startsWith('\\')) {
 		throw new Error('无效的同步路径');
@@ -97,7 +106,7 @@ export function validateVaultPath(input: string): string {
 			part.length === 0 ||
 			part === '.' ||
 			part === '..' ||
-			/[<>:"|?*\u0000-\u001f]/.test(part) ||
+			/[<>:"|?*]/.test(part) || hasAsciiControl(part) ||
 			/[ .]$/.test(part) ||
 			/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(part.normalize('NFKC').split('.')[0].trimEnd()),
 		) ||

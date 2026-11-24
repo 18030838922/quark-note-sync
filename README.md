@@ -16,11 +16,11 @@ The plugin uses Quark Drive's unofficial web API. Changes to that API or to acco
 
 ## Install
 
-1. Download the ZIP from [GitHub Releases](https://github.com/18030838922/quark-note-sync/releases/latest) and extract it.
-2. Copy the extracted `quark-note-sync` folder into `<vault>/.obsidian/plugins/`. Its `manifest.json` and `main.js` should sit directly inside that folder. On Android, use the folder for the vault Obsidian has actually opened. Your file manager may need to show hidden files.
+1. Download `main.js`, `manifest.json`, and `styles.css` from [GitHub Releases](https://github.com/18030838922/quark-note-sync/releases/latest).
+2. Put the three files directly inside `<vault>/.obsidian/plugins/quark-note-sync/`. On Android, use the folder for the vault Obsidian has actually opened. Your file manager may need to show hidden files.
 3. In Obsidian Settings → Community plugins, turn off Restricted mode if needed and enable **Quark Note Sync**.
 
-Requires Obsidian 1.11.4 or later. To update a manual installation, replace `manifest.json` and `main.js`, keep any existing `data.json`, and reload Obsidian.
+Requires Obsidian 1.11.4 or later. To update a manual installation, replace the three release files, keep any existing `data.json`, and reload Obsidian.
 
 ## Set up sync
 
@@ -38,7 +38,7 @@ If a session expires, scan again on Windows or import a fresh authorization code
 
 - The plugin stores the Quark session in Obsidian SecretStorage. It sends the session only to allowed Quark HTTPS endpoints. The session and pairing password are excluded from plugin settings, sync data, and logs.
 - The mobile authorization code is encrypted on the device using PBKDF2-SHA256 and AES-256-GCM. It contains the session and target folder information. Share the code and its password through separate channels.
-- Concurrent versions can produce files under `.quark-sync-conflicts/`. Concurrent edits and deletes preserve the edited content. Synced local deletions use the vault's `.trash` folder where available.
+- Concurrent versions can produce files under `.quark-sync-conflicts/`. Concurrent edits and deletes preserve the edited content. Synced local deletions use Obsidian's configured file deletion preference.
 - The plugin appends version records in the configured Quark Drive folder. Cloud history is retained.
 
 ## Build and test

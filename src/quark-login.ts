@@ -1,3 +1,4 @@
+import { hasAsciiControl } from './core.ts';
 import type { HttpRequest, HttpResponse } from './transport.ts';
 
 const UOP_ORIGIN = 'https://uop.quark.cn';
@@ -42,7 +43,7 @@ export class QuarkQrLogin {
 		const envelope = await this.requestJson({ url: url.toString(), method: 'GET', purpose: 'login' });
 		assertBusinessSuccess(envelope);
 		const token = readString(envelope, ['token']);
-		if (!token || token.length > 1024 || /[\r\n\u0000-\u001f\u007f]/.test(token)) {
+		if (!token || token.length > 1024 || hasAsciiControl(token)) {
 			throw new Error('夸克未返回有效二维码凭据');
 		}
 		const qrUrl = new URL(QR_LOGIN_URL);
@@ -55,7 +56,7 @@ export class QuarkQrLogin {
 	}
 
 	async poll(session: QuarkQrSession): Promise<QuarkQrPollResult> {
-		if (!session.token || session.token.length > 1024 || /[\r\n\u0000-\u001f\u007f]/.test(session.token)) {
+		if (!session.token || session.token.length > 1024 || hasAsciiControl(session.token)) {
 			throw new Error('二维码登录状态无效');
 		}
 		const url = new URL(`${UOP_ORIGIN}/cas/ajax/getServiceTicketByQrcodeToken`);
@@ -70,14 +71,14 @@ export class QuarkQrLogin {
 		if (status === 50004004) return { state: 'cancelled' };
 		if (status !== 2000000) throw new Error('夸克二维码登录检查失败');
 		const serviceTicket = readString(envelope, ['service_ticket', 'serviceTicket']);
-		if (!serviceTicket || serviceTicket.length > 2048 || /[\r\n\u0000-\u001f\u007f]/.test(serviceTicket)) {
+		if (!serviceTicket || serviceTicket.length > 2048 || hasAsciiControl(serviceTicket)) {
 			throw new Error('夸克未返回有效登录凭据');
 		}
 		return { state: 'approved', serviceTicket };
 	}
 
 	async exchangeTicket(serviceTicket: string): Promise<string> {
-		if (!serviceTicket || serviceTicket.length > 2048 || /[\r\n\u0000-\u001f\u007f]/.test(serviceTicket)) {
+		if (!serviceTicket || serviceTicket.length > 2048 || hasAsciiControl(serviceTicket)) {
 			throw new Error('夸克登录凭据无效');
 		}
 		const url = new URL(`${PAN_ORIGIN}/account/info`);
@@ -170,7 +171,7 @@ function selectLoginCookies(header: string | undefined): string | undefined {
 		const pair = /^\s*([^=;\s]+)=([^;\r\n]*)/.exec(line);
 		if (!pair || !LOGIN_COOKIE_NAMES.has(pair[1])) continue;
 		const value = pair[2].trim();
-		if (!value || /[\r\n\u0000-\u001f\u007f]/.test(value)) continue;
+		if (!value || hasAsciiControl(value)) continue;
 		entries.set(pair[1], value);
 	}
 	if (!entries.has('__pus') && !entries.has('__puus')) return undefined;
@@ -178,7 +179,7 @@ function selectLoginCookies(header: string | undefined): string | undefined {
 }
 
 function createRequestId(): string {
-	const cryptoApi = globalThis.crypto;
+	const cryptoApi = typeof window === 'undefined' ? crypto : window.crypto ?? crypto;
 	if (typeof cryptoApi.randomUUID === 'function') return cryptoApi.randomUUID();
 	const bytes = new Uint8Array(16);
 	cryptoApi.getRandomValues(bytes);

@@ -3,7 +3,7 @@ import { MAX_FILE_BYTES, validatePathSet, type VersionEvent } from './core.ts';
 import { sha256Hex } from './hash.ts';
 import { LocalVaultAdapter, CONFLICT_DIRECTORY, type LocalScan } from './local-vault.ts';
 import { createBatchManifest, parseBatchManifest } from './manifest.ts';
-import { QuarkAuthenticationError, QuarkClient, type RemoteFile } from './quark-api.ts';
+import { QuarkAuthenticationError, QuarkClient } from './quark-api.ts';
 import { buildSyncPlan, type SyncPlan, type SyncSnapshot } from './sync-engine.ts';
 import { recoverPendingApply } from './core.ts';
 import { applyIfCurrentHash } from './safe-apply.ts';
@@ -12,7 +12,6 @@ const CLOUD_DATA_DIRECTORY = 'Obsidian Sync Data';
 const CLOUD_BLOB_DIRECTORY = 'blobs';
 const CLOUD_EVENT_DIRECTORY = 'events';
 const MANIFEST_NAME = /^[a-f\d]{64}\.json$/i;
-const BLOB_NAME = /^[a-f\d]{64}\.bin$/i;
 const MAX_MANIFEST_BYTES = 5 * 1024 * 1024;
 
 export interface SyncSettingsView {

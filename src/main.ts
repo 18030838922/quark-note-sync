@@ -1,3 +1,4 @@
+import { hasAsciiControl } from './core.ts';
 import {
 	Modal,
 	Notice,
@@ -15,7 +16,7 @@ import type { SyncPlan, SyncSnapshot } from './sync-engine.ts';
 import { QuarkAuthenticationError, QuarkClient } from './quark-api.ts';
 import { QuarkTransport, type HttpRequest, type HttpResponse } from './transport.ts';
 import { QuarkQrLogin, type QuarkQrSession } from './quark-login.ts';
-import { createPairingCode, readPairingCode, type PairingPayload } from './pairing-code.ts';
+import { createPairingCode, readPairingCode } from './pairing-code.ts';
 import { settingsText, type Language } from './settings-text.ts';
 
 const PLUGIN_ID = 'quark-note-sync';
@@ -295,7 +296,7 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 			return;
 		}
 		const name = value.trim();
-		if (!name || name.length > 50 || /[\r\n\u0000-\u001f\u007f]/.test(name)) {
+		if (!name || name.length > 50 || hasAsciiControl(name)) {
 			new Notice('设备名称需为 1 至 50 个字符，且不能包含换行或控制字符');
 			return;
 		}
@@ -689,7 +690,7 @@ class QuarkSettingsTab extends PluginSettingTab {
 		containerEl.empty();
 		const language = this.plugin.settingsView.language;
 		const copy = settingsText[language];
-		containerEl.createEl('h2', { text: copy.title });
+		new Setting(containerEl).setName(copy.title).setHeading();
 		new Setting(containerEl)
 			.setName('语言 / Language')
 			.addDropdown((dropdown) => dropdown
@@ -1023,16 +1024,15 @@ class ExportPairingModal extends Modal {
 		confirmation.setAttribute('autocapitalize', 'off');
 		confirmation.setAttribute('spellcheck', 'false');
 		const status = this.contentEl.createEl('p', { text: '' });
-		const code = this.contentEl.createEl('textarea', { attr: { rows: '7', readonly: 'true', 'aria-label': '加密授权码' } });
-		code.style.width = '100%';
-		code.style.display = 'none';
+		const code = this.contentEl.createEl('textarea', { cls: 'quark-note-sync-pairing-code', attr: { rows: '7', readonly: 'true', 'aria-label': '加密授权码' } });
+		code.hidden = true;
 		const buttons = this.contentEl.createDiv({ cls: 'modal-button-container' });
 		const generate = buttons.createEl('button', { text: '生成授权码', cls: 'mod-cta' });
 		const copy = buttons.createEl('button', { text: '复制授权码' });
 		copy.disabled = true;
 		copy.addEventListener('click', () => void copyText(code.value, status));
 		buttons.createEl('button', { text: '关闭' }).addEventListener('click', () => this.close());
-		generate.addEventListener('click', async () => {
+		const generateCode = async () => {
 			if (password.value !== confirmation.value) {
 				status.setText('两次输入的密码不一致。');
 				return;
@@ -1048,13 +1048,14 @@ class ExportPairingModal extends Modal {
 				password.value = '';
 				confirmation.value = '';
 				code.value = result;
-				code.style.display = '';
+				code.hidden = false;
 				copy.disabled = false;
 				status.setText('授权码已生成。请在 15 分钟内导入手机；密码不会保存。');
 			} finally {
 				generate.disabled = false;
 			}
-		});
+		};
+		generate.addEventListener('click', () => void generateCode());
 	}
 }
 
@@ -1070,8 +1071,7 @@ class ImportPairingModal extends Modal {
 		this.setTitle('导入电脑授权');
 		this.contentEl.empty();
 		this.contentEl.createEl('p', { text: '粘贴 Windows 端生成的加密授权码，再输入相同密码。导入会验证夸克账号和云端目录；不会自动开始同步。' });
-		const code = this.contentEl.createEl('textarea', { attr: { rows: '7', placeholder: '粘贴 QPS1 开头的授权码', 'aria-label': '加密授权码' } });
-		code.style.width = '100%';
+		const code = this.contentEl.createEl('textarea', { cls: 'quark-note-sync-pairing-code', attr: { rows: '7', placeholder: '粘贴 QPS1 开头的授权码', 'aria-label': '加密授权码' } });
 		code.setAttribute('autocapitalize', 'off');
 		code.setAttribute('spellcheck', 'false');
 		const password = this.contentEl.createEl('input', { attr: { type: 'password', autocomplete: 'off', placeholder: '授权密码' } });
@@ -1081,7 +1081,7 @@ class ImportPairingModal extends Modal {
 		const buttons = this.contentEl.createDiv({ cls: 'modal-button-container' });
 		const importButton = buttons.createEl('button', { text: '验证并导入', cls: 'mod-cta' });
 		buttons.createEl('button', { text: '取消' }).addEventListener('click', () => this.close());
-		importButton.addEventListener('click', async () => {
+		const importCode = async () => {
 			if (!code.value.trim() || !password.value) {
 				status.setText('请填写授权码和密码。');
 				return;
@@ -1096,7 +1096,8 @@ class ImportPairingModal extends Modal {
 				password.value = '';
 				importButton.disabled = false;
 			}
-		});
+		};
+		importButton.addEventListener('click', () => void importCode());
 	}
 }
 
@@ -1191,7 +1192,7 @@ class ConfirmationModal extends Modal {
 }
 
 function appendList(container: HTMLElement, title: string, items: string[]): void {
-	container.createEl('h4', { text: `${title}（${items.length}）` });
+	new Setting(container).setName(`${title}（${items.length}）`).setHeading();
 	if (items.length === 0) {
 		container.createEl('p', { text: '无' });
 		return;
@@ -1301,7 +1302,7 @@ function emptyMap<T>(): Record<string, T> {
 }
 
 function isSafeCloudDirectoryName(name: string): boolean {
-	return name.length > 0 && name.length <= 80 && name !== '.' && name !== '..' && !/[\\/\u0000-\u001f\u007f]/.test(name);
+	return name.length > 0 && name.length <= 80 && name !== '.' && name !== '..' && !/[\\/]/.test(name) && !hasAsciiControl(name);
 }
 
 function isSafeIdentity(value: string): boolean {
@@ -1316,7 +1317,7 @@ function filterPairingCookie(cookie: string): string {
 		if (separator <= 0) continue;
 		const name = part.slice(0, separator).trim();
 		const value = part.slice(separator + 1).trim();
-		if (!allowed.has(name) || !value || /[\r\n\u0000-\u001f\u007f]/.test(value)) continue;
+		if (!allowed.has(name) || !value || hasAsciiControl(value)) continue;
 		values.set(name, value);
 	}
 	if (!values.has('__pus') && !values.has('__puus')) throw new Error('当前会话没有可导出的夸克网页凭据，请重新扫码登录或检查手动 Cookie');
@@ -1332,27 +1333,17 @@ function safeModalError(error: unknown): string {
 
 async function copyText(value: string, status: HTMLElement): Promise<void> {
 	try {
-		if (navigator.clipboard?.writeText) {
-			await navigator.clipboard.writeText(value);
-			status.setText('授权码已复制；密码仍需单独传给手机。');
-			return;
-		}
-		const input = document.createElement('textarea');
-		input.value = value;
-		input.style.position = 'fixed';
-		input.style.opacity = '0';
-		document.body.appendChild(input);
-		input.select();
-		const copied = document.execCommand('copy');
-		input.remove();
-		status.setText(copied ? '授权码已复制；密码仍需单独传给手机。' : '复制失败，请手动选择并复制授权码。');
+		const clipboard = status.ownerDocument.defaultView?.navigator.clipboard;
+		if (!clipboard) throw new Error('Clipboard API unavailable');
+		await clipboard.writeText(value);
+		status.setText('授权码已复制；密码仍需单独传给手机。');
 	} catch {
 		status.setText('复制失败，请手动选择并复制授权码。');
 	}
 }
 
 function createDeviceId(): string {
-	const cryptoApi = globalThis.crypto;
+	const cryptoApi = typeof window === 'undefined' ? crypto : window.crypto ?? crypto;
 	if (typeof cryptoApi.randomUUID === 'function') return cryptoApi.randomUUID().toLowerCase();
 	const bytes = new Uint8Array(16);
 	cryptoApi.getRandomValues(bytes);

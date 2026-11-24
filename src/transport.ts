@@ -1,3 +1,6 @@
+import type { IncomingMessage } from 'node:http';
+import type * as NodeHttps from 'node:https';
+
 const COOKIE_API_HOSTS = new Set(['drive-pc.quark.cn', 'drive.quark.cn', 'pan.quark.cn']);
 
 export type QuarkHostKind = 'authenticated-api' | 'quark-transfer';
@@ -108,7 +111,7 @@ export class QuarkTransport {
 		request: HttpRequest,
 		headers: Record<string, string>,
 	): Promise<HttpResponse> {
-		const bridge = (window as unknown as {
+		const bridge = (window as Window & {
 			Capacitor?: {
 				isNativePlatform?: () => boolean;
 				Plugins?: { CapacitorHttp?: { request: (options: Record<string, unknown>) => Promise<Record<string, unknown>> } };
@@ -156,7 +159,7 @@ export class QuarkTransport {
 				method: request.method,
 				headers,
 				timeout: 60000,
-			}, (incoming: any) => {
+			}, (incoming: IncomingMessage) => {
 				const chunks: Uint8Array[] = [];
 				incoming.on('data', (chunk: Uint8Array | string) => {
 					chunks.push(typeof chunk === 'string' ? new TextEncoder().encode(chunk) : new Uint8Array(chunk));
@@ -229,14 +232,15 @@ function bytesToBase64(bytes: Uint8Array): string {
 	return btoa(binary);
 }
 
-function getNodeRequire(): ((name: string) => any) | undefined {
+type HttpsRequire = (name: 'node:https') => typeof NodeHttps;
+
+function getNodeRequire(): HttpsRequire | undefined {
 	try {
-		return (window as unknown as { require?: (name: string) => any }).require ??
-			(globalThis as unknown as { require?: (name: string) => any }).require ??
-			(typeof require === 'function' ? require : undefined);
+		const desktopWindow = window as Window & { require?: HttpsRequire };
+		return desktopWindow.require ?? (typeof require === 'function' ? require : undefined);
 	} catch {
 		return undefined;
 	}
 }
 
-declare const require: ((name: string) => any) | undefined;
+declare const require: HttpsRequire | undefined;

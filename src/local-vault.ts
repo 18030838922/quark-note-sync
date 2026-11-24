@@ -121,7 +121,7 @@ export class LocalVaultAdapter {
 		if (expectedCurrentHash !== undefined && await this.currentHash(path) !== expectedCurrentHash) {
 			throw new Error(`本地文件已变化，拒绝删除：${path}`);
 		}
-		await this.app.vault.trash(existing, false);
+		await this.app.fileManager.trashFile(existing);
 	}
 
 	listPaths(configDir: string): string[] {

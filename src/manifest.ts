@@ -98,8 +98,8 @@ async function validateEvent(event: VersionEvent, manifestDeviceId: string): Pro
 	}
 }
 
-function asRecord(input: unknown): Record<string, any> {
-	return input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, any> : {};
+function asRecord(input: unknown): Record<string, unknown> {
+	return input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
 }
 
 function compareId(left: string, right: string): number {

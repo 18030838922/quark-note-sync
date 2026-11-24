@@ -1,3 +1,4 @@
+import { hasAsciiControl } from './core.ts';
 const VERSION = 1;
 const CODE_PREFIX = 'QPS1';
 const DOMAIN = 'quark-note-sync/pairing-code/v1';
@@ -28,7 +29,7 @@ type EncryptedPayload = PairingPayload & {
 const encoder = new TextEncoder();
 
 function getCrypto(): Crypto {
-	const cryptoApi = globalThis.crypto;
+	const cryptoApi = typeof window === 'undefined' ? crypto : window.crypto ?? crypto;
 	if (!cryptoApi?.subtle || typeof cryptoApi.getRandomValues !== 'function') {
 		throw new Error('当前环境不支持安全的配对码加密');
 	}
@@ -55,7 +56,7 @@ function validateTextField(value: unknown, label: string, maxLength: number): as
 	if (typeof value !== 'string' || value.trim().length === 0 || value.length > maxLength) {
 		throw new Error(`${label}无效`);
 	}
-	if (/[\u0000-\u001f\u007f]/.test(value)) throw new Error(`${label}包含无效字符`);
+	if (hasAsciiControl(value)) throw new Error(`${label}包含无效字符`);
 }
 
 function validatePayload(payload: PairingPayload): PairingPayload {

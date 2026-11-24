@@ -1,5 +1,6 @@
+import { hasAsciiControl } from './core.ts';
 import { md5Base64, md5Hex, sha1Hex } from './hash.ts';
-import type { HttpRequest, HttpResponse, RequestPurpose } from './transport';
+import type { HttpRequest, HttpResponse } from './transport';
 import { QuarkTransportError } from './transport.ts';
 
 const DRIVE_ORIGIN = 'https://drive-pc.quark.cn';
@@ -289,7 +290,8 @@ export class QuarkClient {
 
 	async downloadFile(file: RemoteFile): Promise<Uint8Array> {
 		const data = await this.requestApi(`${DRIVE_API}/file/download`, 'POST', {}, { fids: [file.fid] });
-		const entries = Array.isArray(data) ? data : Array.isArray(asRecord(data).list) ? asRecord(data).list as unknown[] : [];
+		const candidates = Array.isArray(data) ? data : asRecord(data).list;
+		const entries: unknown[] = Array.isArray(candidates) ? candidates : [];
 	const records = entries.map(asRecord);
 		const matched = records.find((entry) => String(entry.fid ?? '') === file.fid);
 		const info = matched ?? (records.length === 1 && records[0].fid === undefined ? records[0] : undefined);
@@ -344,7 +346,7 @@ export class QuarkClient {
 		try {
 			return await this.confirmUploaded(parentId, name, size, fid);
 		} catch (visibilityError) {
-			if (finishError) throw finishError;
+			if (finishError instanceof Error) throw finishError;
 			throw visibilityError;
 		}
 	}
@@ -355,7 +357,7 @@ export class QuarkClient {
 		params: Record<string, string> = {},
 		body?: Record<string, unknown>,
 	): Promise<Record<string, unknown> | unknown[]> {
-		const url = urlOrPath.startsWith('https://') ? new URL(urlOrPath) : new URL(urlOrPath);
+		const url = new URL(urlOrPath);
 		if (url.hostname === 'drive-pc.quark.cn') {
 			url.searchParams.set('pr', 'ucpro');
 			url.searchParams.set('fr', 'pc');
@@ -411,12 +413,12 @@ export class QuarkClient {
 			throw new Error(`夸克 API 返回错误代码 ${code}`);
 		}
 		this.cookie = mergeQuarkSessionCookies(this.cookie, response.headers['set-cookie'] ?? response.headers['Set-Cookie']);
-		if (!('data' in envelope)) return envelope as Record<string, unknown>;
+		if (!('data' in envelope)) return envelope;
 		const payload = envelope.data ?? {};
 		if (payload && typeof payload === 'object' && !Array.isArray(payload) && envelope.metadata !== undefined) {
-			return { ...(payload as Record<string, unknown>), __envelope_metadata: envelope.metadata };
+			return { ...payload, __envelope_metadata: envelope.metadata };
 		}
-		return payload as Record<string, unknown> | unknown[];
+		return payload;
 	}
 }
 
@@ -454,8 +456,8 @@ function normalizeRemoteFile(input: unknown): RemoteFile {
 	return { fid: String(fid), name, isDirectory, size };
 }
 
-function asRecord(value: unknown): Record<string, any> {
-	return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, any> : {};
+function asRecord(value: unknown): Record<string, unknown> {
+	return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 
 function readNonNegativeNumber(value: unknown): number | undefined {
@@ -474,7 +476,10 @@ function readPositiveNumber(value: unknown): number | undefined {
 }
 
 function delay(milliseconds: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, milliseconds));
+	return new Promise((resolve) => {
+		if (typeof window === 'undefined') setTimeout(resolve, milliseconds);
+		else window.setTimeout(resolve, milliseconds);
+	});
 }
 
 function firstString(...values: unknown[]): string | undefined {
@@ -562,7 +567,7 @@ function readAccountNickname(input: unknown): string | undefined {
 		for (const [key, candidate] of Object.entries(value as Record<string, unknown>)) {
 			if (fields.has(key) && typeof candidate === 'string') {
 				const nickname = candidate.trim();
-				if (nickname && Array.from(nickname).length <= 128 && !/[\u0000-\u001f\u007f]/.test(nickname)) return nickname;
+				if (nickname && Array.from(nickname).length <= 128 && !hasAsciiControl(nickname)) return nickname;
 			}
 			if (candidate && typeof candidate === 'object') queue.push(candidate);
 		}
@@ -589,14 +594,14 @@ function mergeQuarkSessionCookies(cookie: string, setCookie: string | undefined)
 		if (separator <= 0) continue;
 		const name = part.slice(0, separator).trim();
 		const value = part.slice(separator + 1).trim();
-		if (allowed.has(name) && value && !/[\r\n\u0000-\u001f\u007f]/.test(value)) values.set(name, value);
+		if (allowed.has(name) && value && !hasAsciiControl(value)) values.set(name, value);
 	}
 	const lines = setCookie.split(/[\r\n]+/).flatMap((line) => line.split(/,\s*(?=[!#$%&'*+.^_`|~0-9A-Za-z-]+=)/));
 	for (const line of lines) {
 		const match = /^\s*([^=;\s]+)=([^;\r\n]*)/.exec(line);
 		if (!match || !allowed.has(match[1])) continue;
 		const value = match[2].trim();
-		if (value && !/[\r\n\u0000-\u001f\u007f]/.test(value)) values.set(match[1], value);
+		if (value && !hasAsciiControl(value)) values.set(match[1], value);
 	}
 	return Array.from(values, ([name, value]) => `${name}=${value}`).join('; ') || cookie;
 }

@@ -18,7 +18,10 @@ function createTextNode(text?: string): TextNode {
 	const children: TextNode[] = [];
 	const createChild = (value?: string) => { const child = createTextNode(value); children.push(child); return child; };
 	return { text, children, empty: () => { children.length = 0; },
-		createEl: (_tag, options) => createChild(options?.text), createDiv: () => createChild() };
+		createEl: (tag, options) => {
+			assert.notEqual(tag, 'h2', 'plugin settings must use the Obsidian heading component');
+			return createChild(options?.text);
+		}, createDiv: () => createChild() };
 }
 
 function renderedText(node: TextNode): string[] {
@@ -34,6 +37,7 @@ async function loadPlugin(data: object, savedCookie: string | null = 'sid=fixtur
 		private row: TextNode;
 		constructor(container: TextNode) { this.row = container.createDiv(); }
 		setName(text: string) { this.row.createEl('label', { text }); return this; }
+		setHeading() { return this; }
 		setDesc(text: string) { this.row.createEl('p', { text }); return this; }
 		addButton(render: (button: unknown) => void) {
 			const row = this.row;
@@ -215,6 +219,7 @@ test('startup sync is off by default and can be persisted independently', async 
 test('settings display Chinese by default, switch immediately, and remember the selected language', async () => {
 	const fixture = await loadPlugin({}, null);
 	fixture.showSettings();
+	assert.ok(fixture.settingsText().includes('夸克笔记同步'));
 	assert.ok(fixture.settingsText().includes('扫码登录'));
 	await fixture.switchLanguage('en');
 	assert.equal(fixture.state.language, 'en');

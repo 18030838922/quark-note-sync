@@ -14,21 +14,15 @@
 - 首次同步先预览，再由用户确认执行。“打开 Obsidian 时同步”和定时同步默认关闭，可在首次同步完成后分别开启。启动同步在仓库载入后执行一次。定时同步默认每 5 分钟执行，只在 Obsidian 打开期间运行。
 - Windows 可使用夸克普通网页扫码登录；Android 可本地导入 Windows 生成的加密授权码。授权码只通过本地加密包含夸克会话和专用目录信息，不含笔记、同步历史或电脑绝对路径。
 - Cookie 只用于向夸克发出的 HTTPS 请求；Cookie 和授权密码不写入插件 `data.json`、笔记同步数据或日志。手动 Cookie 仍保留为高级设置中的备用方式。
-- 并发编辑会保留冲突副本为本地 `.quark-sync-conflicts/` 下的文件，该目录不再参与同步。单独删除的文件会通过 Obsidian Vault 回收站（`.trash`）保留；需要恢复时，用设备文件管理器将文件从 `.trash` 移回原路径，或使用 Obsidian 提供的常规恢复方式。插件没有单独的恢复控制。删除与编辑并发时保留编辑内容。
+- 并发编辑会保留冲突副本为本地 `.quark-sync-conflicts/` 下的文件，该目录不再参与同步。同步删除遵循 Obsidian 的文件删除偏好。若使用回收站，可通过对应的回收站恢复文件。删除与编辑并发时保留编辑内容。
 - 云端版本记录采用追加方式。插件不会调用夸克的永久删除接口；同步内容和历史记录会保留在夸克目录中。
 
 ## 安装
 
-1. 从 [GitHub Releases](https://github.com/18030838922/quark-note-sync/releases/latest) 下载插件 ZIP 并解压，确认解压后有 `quark-note-sync` 文件夹，且其中直接包含 `manifest.json` 和 `main.js`。
-2. 将整个 `quark-note-sync` 文件夹复制到 Vault 的 `.obsidian/plugins/` 目录。最终结构应为：
-
-   ```text
-   <Vault>/.obsidian/plugins/quark-note-sync/manifest.json
-   <Vault>/.obsidian/plugins/quark-note-sync/main.js
-   ```
-
+1. 从 [GitHub Releases](https://github.com/18030838922/quark-note-sync/releases/latest) 下载 `manifest.json`、`main.js` 和 `styles.css`。
+2. 将这三个文件直接放进笔记库的 `.obsidian/plugins/quark-note-sync/` 文件夹。
 3. 在 Obsidian 设置 → 第三方插件中，关闭受限模式（如尚未关闭），重新加载插件列表并启用“Quark Note Sync”。
-4. Android 的 Vault 文件夹与桌面版一样有 `.obsidian/plugins/` 目录。将插件解压并复制到 Vault 实际所在的设备存储路径；使用能显示隐藏文件、且能访问 Vault 所在存储位置的文件管理器操作，部分设备需要在系统文件选择器中先授予该 Vault 的访问权限。
+4. Android 的 Vault 文件夹与桌面版一样有 `.obsidian/plugins/` 目录。将发布文件复制到 Vault 实际所在的设备存储路径；使用能显示隐藏文件、且能访问 Vault 所在存储位置的文件管理器操作，部分设备需要在系统文件选择器中先授予该 Vault 的访问权限。
 
 插件使用 Obsidian SecretStorage 保存 Cookie，因此要求 Obsidian 1.11.4 或更新版本；该版本要求也写在 `manifest.json` 中。
 

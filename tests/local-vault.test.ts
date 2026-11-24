@@ -53,3 +53,14 @@ test('canonical write refuses to overwrite bytes that changed after the scan', a
 	);
 	assert.equal(modifications, 0);
 });
+
+test('sync deletions honor Obsidian file deletion preferences through the file manager', async () => {
+	const file = { path: 'notes.md', stat: { size: 1 }, extension: 'md' };
+	const removed: unknown[] = [];
+	const app = {
+		vault: { getAbstractFileByPath: () => file },
+		fileManager: { trashFile: async (target: unknown) => { removed.push(target); } },
+	} as unknown as App;
+	await new LocalVaultAdapter(app).trash(file.path, '.obsidian');
+	assert.deepEqual(removed, [file]);
+});

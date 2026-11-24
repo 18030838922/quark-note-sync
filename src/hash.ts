@@ -84,9 +84,10 @@ export function md5Base64(input: Uint8Array): string {
 }
 
 async function digest(algorithm: 'SHA-1' | 'SHA-256', input: Uint8Array): Promise<Uint8Array> {
-	if (!globalThis.crypto?.subtle) throw new Error('此设备不支持 Web Crypto');
+	const cryptoApi = typeof window === 'undefined' ? crypto : window.crypto ?? crypto;
+	if (!cryptoApi?.subtle) throw new Error('此设备不支持 Web Crypto');
 	const source = input.slice();
-	return new Uint8Array(await globalThis.crypto.subtle.digest(algorithm, source));
+	return new Uint8Array(await cryptoApi.subtle.digest(algorithm, source));
 }
 
 function bytesToHex(input: Uint8Array): string {
