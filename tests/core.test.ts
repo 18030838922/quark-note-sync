@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-	MAX_FILE_BYTES,
 	isSyncablePath,
 	recoverPendingApply,
 	resolvePathEvents,
@@ -74,10 +73,12 @@ test('missing parents mark history incomplete instead of guessing the current ve
 	);
 });
 
-test('file history rejects versions outside the supported size limit', () => {
+test('file history accepts large attachments but rejects invalid sizes', () => {
+	const large = { ...file('large', [], 'hash'), size: 11 * 1024 * 1024 };
+	assert.doesNotThrow(() => resolvePathEvents([large]));
 	assert.throws(
-		() => resolvePathEvents([{ ...file('too-large', [], 'hash'), size: MAX_FILE_BYTES + 1 }]),
-		/大小上限/,
+		() => resolvePathEvents([{ ...file('invalid-size', [], 'hash'), size: -1 }]),
+		/大小无效/,
 	);
 });
 
@@ -126,10 +127,9 @@ test('path sets reject Windows case or Unicode collisions and file-directory col
 	assert.deepEqual(validatePathSet(['a.md', '附件/图.png'], '.obsidian'), ['a.md', '附件/图.png']);
 });
 
-test('syncable file checks enforce the size cap and exclude local conflict/config state', () => {
-	assert.equal(MAX_FILE_BYTES, 10 * 1024 * 1024);
+test('syncable file checks accept large files and exclude local conflict/config state', () => {
 	assert.equal(isSyncablePath('附件/图.png', 1024, '.obsidian'), true);
-	assert.equal(isSyncablePath('大文件.zip', MAX_FILE_BYTES + 1, '.obsidian'), false);
+	assert.equal(isSyncablePath('大文件.zip', 11 * 1024 * 1024, '.obsidian'), true);
 	assert.equal(isSyncablePath('.obsidian/plugins/quark-note-sync/data.json', 100, '.obsidian'), false);
 	assert.equal(isSyncablePath('.quark-sync-conflicts/计划.md', 100, '.obsidian'), false);
 	assert.equal(isSyncablePath('local/state.md', 100, 'local'), false);

@@ -8,7 +8,7 @@ The plugin uses Quark Drive's unofficial web API. Changes to that API or to acco
 
 ## Features
 
-- Sync Markdown notes, Canvas files, and ordinary attachments up to 10 MiB per file.
+- Sync Markdown notes, Canvas files, and ordinary attachments. File transfers depend on available device memory and Quark Drive limits. Update the plugin on every device before syncing files larger than 10 MiB because earlier versions reject their sync records.
 - Preview the first sync and confirm it manually before any sync changes are applied.
 - Enable sync when Obsidian opens, periodic sync, or both. Both settings are off by default. Startup sync runs once after the vault loads. Periodic sync defaults to every five minutes while Obsidian is open.
 - Sign in by QR code on Windows, Android, or iOS/iPadOS. Mobile devices can also import an encrypted authorization code. Manage the saved session in the Quark account section of the plugin settings.

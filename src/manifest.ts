@@ -1,4 +1,4 @@
-import { MAX_FILE_BYTES, validateVaultPath, type VersionEvent } from './core.ts';
+import { validateVaultPath, type VersionEvent } from './core.ts';
 import { sha256Hex } from './hash.ts';
 
 export interface BatchManifest {
@@ -77,8 +77,8 @@ async function validateEvent(event: VersionEvent, manifestDeviceId: string): Pro
 	if (!Number.isSafeInteger(event.createdAt) || event.createdAt < 0) throw new Error('清单校验失败：时间无效');
 	if (event.kind === 'file') {
 		if (typeof event.sha256 !== 'string' || !/^[a-f\d]{64}$/i.test(event.sha256)) throw new Error('清单校验失败：文件摘要无效');
-		if (!Number.isSafeInteger(event.size) || (event.size ?? MAX_FILE_BYTES + 1) < 0 || (event.size ?? MAX_FILE_BYTES + 1) > MAX_FILE_BYTES) {
-			throw new Error('清单校验失败：文件超过大小上限');
+		if (!Number.isSafeInteger(event.size) || (event.size ?? -1) < 0) {
+			throw new Error('清单校验失败：文件大小无效');
 		}
 	} else if (event.kind === 'delete') {
 		if (event.sha256 !== undefined || event.size !== undefined) throw new Error('清单校验失败：删除版本包含文件内容');

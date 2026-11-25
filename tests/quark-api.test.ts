@@ -206,6 +206,8 @@ test('Pan account-info negative semantic status is rejected even when code is OK
 });
 
 test('upload normalizes approved host hints to HTTPS and sends signed bytes without the Quark Cookie', async () => {
+	const partSize = 4 * 1024 * 1024;
+	const content = new Uint8Array(11 * 1024 * 1024);
 	let uploaded = false;
 	let uploadUrl = 'http://pds.quark.cn';
 	const transport = new FixtureTransport((request) => {
@@ -214,10 +216,10 @@ test('upload normalizes approved host hints to HTTPS and sends signed bytes with
 			return { status: request.method === 'PUT' ? 200 : 200, headers: { etag: 'a1b2c3' }, url: request.url, data: new Uint8Array(), text: () => '' };
 		}
 		if (url.pathname.endsWith('/file/sort')) {
-			return response({ code: 0, data: { list: uploaded ? [{ fid: 'blob-fid', file_name: 'blob.bin', file_type: 1, size: 2 }] : [], metadata: { _total: uploaded ? 1 : 0 } } });
+			return response({ code: 0, data: { list: uploaded ? [{ fid: 'blob-fid', file_name: 'blob.bin', file_type: 1, size: content.byteLength }] : [], metadata: { _total: uploaded ? 1 : 0 } } });
 		}
 		if (url.pathname.endsWith('/file/upload/pre')) {
-			return response({ code: 0, data: { task_id: 'task', auth_info: 'auth', upload_id: 'upload', obj_key: 'object', bucket: 'bucket', upload_url: uploadUrl, callback: {} }, metadata: { part_size: 1 } });
+			return response({ code: 0, data: { task_id: 'task', auth_info: 'auth', upload_id: 'upload', obj_key: 'object', bucket: 'bucket', upload_url: uploadUrl, callback: {} }, metadata: { part_size: partSize } });
 		}
 		if (url.pathname.endsWith('/file/update/hash')) return response({ code: 0, data: { finish: false } });
 		if (url.pathname.endsWith('/file/upload/auth')) return response({ code: 0, data: { auth_key: 'one-time-signature' } });
@@ -229,11 +231,12 @@ test('upload normalizes approved host hints to HTTPS and sends signed bytes with
 	});
 
 	const client = new QuarkClient(transport, 'sid=secret');
-	const file = await client.uploadFile('blob-folder', 'blob.bin', new Uint8Array([1, 2]));
+	const file = await client.uploadFile('blob-folder', 'blob.bin', content);
 	assert.equal(file.fid, 'blob-fid');
 	assert.ok(transport.requests.some((request) => new URL(request.url).pathname.endsWith('/file/update/hash')));
 	assert.ok(transport.requests.filter((request) => request.purpose === 'upload').length >= 2);
-	assert.equal(transport.requests.filter((request) => request.purpose === 'upload' && request.method === 'PUT').length, 2);
+	const parts = transport.requests.filter((request) => request.purpose === 'upload' && request.method === 'PUT');
+	assert.deepEqual(parts.map((request) => (request.body as Uint8Array).byteLength), [partSize, partSize, content.byteLength - 2 * partSize]);
 	assert.ok(transport.requests.filter((request) => request.purpose === 'upload').every((request) => request.cookie === undefined));
 	assert.ok(transport.requests.filter((request) => request.purpose !== 'upload').every((request) => request.cookie === 'sid=secret'));
 	assert.ok(transport.requests.filter((request) => request.purpose === 'upload').every((request) => new URL(request.url).origin === 'https://bucket.pds.quark.cn'));
@@ -248,7 +251,7 @@ test('upload normalizes approved host hints to HTTPS and sends signed bytes with
 		const requestStart = transport.requests.length;
 		uploaded = false;
 		uploadUrl = hostHint;
-		await client.uploadFile('blob-folder', 'blob.bin', new Uint8Array([1, 2]));
+		await client.uploadFile('blob-folder', 'blob.bin', content);
 		const hostHintRequests = transport.requests.slice(requestStart).filter((request) => request.purpose === 'upload');
 		assert.ok(hostHintRequests.length >= 2);
 		assert.ok(hostHintRequests.every((request) => new URL(request.url).origin === expectedOrigin));

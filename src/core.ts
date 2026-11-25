@@ -1,5 +1,3 @@
-export const MAX_FILE_BYTES = 10 * 1024 * 1024;
-
 export interface VersionEvent {
 	id: string;
 	path: string;
@@ -34,8 +32,8 @@ export function resolvePathEvents(events: VersionEvent[]): ResolvedPath {
 		if (!event.id || byId.has(event.id)) throw new IncompleteHistoryError('发现重复或无效的版本编号');
 		if (event.path !== events[0].path) throw new IncompleteHistoryError('版本记录跨越了多个路径');
 		if (event.kind === 'file' && !event.sha256) throw new IncompleteHistoryError('文件版本缺少 SHA-256');
-		if (event.kind === 'file' && (!Number.isSafeInteger(event.size) || (event.size ?? -1) < 0 || (event.size ?? MAX_FILE_BYTES + 1) > MAX_FILE_BYTES)) {
-			throw new IncompleteHistoryError('文件版本超过大小上限');
+		if (event.kind === 'file' && (!Number.isSafeInteger(event.size) || (event.size ?? -1) < 0)) {
+			throw new IncompleteHistoryError('文件版本大小无效');
 		}
 		if (new Set(event.parents).size !== event.parents.length) throw new IncompleteHistoryError('版本记录包含重复父版本');
 		byId.set(event.id, event);
@@ -152,9 +150,9 @@ export function validatePathSet(paths: string[], configDir: string): string[] {
 	return valid;
 }
 
-/** Markdown, Canvas, and ordinary attachments are eligible; local state and oversized files are not. */
+/** Markdown, Canvas, and ordinary attachments are eligible; local state and files with invalid sizes are not. */
 export function isSyncablePath(path: string, size: number, configDir: string): boolean {
-	if (!Number.isSafeInteger(size) || size < 0 || size > MAX_FILE_BYTES) return false;
+	if (!Number.isSafeInteger(size) || size < 0) return false;
 	try {
 		const validPath = validateVaultPath(path);
 		const key = validPath.normalize('NFKC').toLowerCase();

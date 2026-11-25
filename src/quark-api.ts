@@ -186,7 +186,6 @@ export class QuarkClient {
 	}
 
 	async uploadFile(parentId: string, name: string, content: Uint8Array): Promise<RemoteFile> {
-		if (content.byteLength > 10 * 1024 * 1024) throw new Error('单个上传文件超过 10 MiB');
 		const existing = await this.findChildByName(parentId, name);
 		if (existing) {
 			if (existing.isDirectory || existing.size !== content.byteLength) throw new Error(`夸克中同名文件大小不符：${name}`);

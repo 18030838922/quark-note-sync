@@ -60,12 +60,12 @@ test('an offline local edit and remote edit become concurrent heads with a prese
 	assert.equal(new Set([plan.paths[0].result.winner?.sha256, plan.paths[0].result.conflictCopies[0].sha256]).size, 2);
 });
 
-test('a deleted local path does not tombstone an oversized path still present on disk', async () => {
+test('a deleted local path does not tombstone a path that changed during scanning still present on disk', async () => {
 	const plan = await buildSyncPlan({
 		configDir: '.obsidian',
 		localFiles: [],
 		presentPaths: ['notes.md'],
-		protectedPaths: new Map([['notes.md', '超过 10 MiB，已跳过']]),
+		protectedPaths: new Map([['notes.md', '读取期间文件大小发生变化，已跳过']]),
 		snapshots: snapshot('hash-base'),
 		remoteEvents: [base],
 		deviceId: 'pc',
@@ -73,7 +73,7 @@ test('a deleted local path does not tombstone an oversized path still present on
 	});
 	assert.equal(plan.events.length, 0);
 	assert.equal(plan.paths.length, 0);
-	assert.match(plan.skipped[0].reason, /10 MiB/);
+	assert.match(plan.skipped[0].reason, /大小发生变化/);
 	assert.deepEqual(plan.nextSnapshots['notes.md'], { hash: 'hash-base', heads: ['base'] });
 });
 

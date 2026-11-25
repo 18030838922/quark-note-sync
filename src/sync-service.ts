@@ -1,5 +1,5 @@
 import type { App } from 'obsidian';
-import { MAX_FILE_BYTES, validatePathSet, type VersionEvent } from './core.ts';
+import { validatePathSet, type VersionEvent } from './core.ts';
 import { sha256Hex } from './hash.ts';
 import { LocalVaultAdapter, CONFLICT_DIRECTORY, type LocalScan } from './local-vault.ts';
 import { createBatchManifest, parseBatchManifest } from './manifest.ts';
@@ -13,7 +13,8 @@ const CLOUD_DATA_DIRECTORY = 'Obsidian Sync Data';
 const CLOUD_BLOB_DIRECTORY = 'blobs';
 const CLOUD_EVENT_DIRECTORY = 'events';
 const MANIFEST_NAME = /^[a-f\d]{64}\.json$/i;
-const MAX_MANIFEST_BYTES = 5 * 1024 * 1024;
+const TARGET_MANIFEST_BATCH_BYTES = 5 * 1024 * 1024;
+const MAX_MANIFEST_BYTES = 10 * 1024 * 1024;
 
 export interface SyncSettingsView {
 	cloudDirectoryName: string;
@@ -90,7 +91,7 @@ export class QuarkSyncService {
 		let deleted = 0;
 		let conflicts = 0;
 
-		const batches = splitEvents(plan.events, MAX_MANIFEST_BYTES);
+		const batches = splitEvents(plan.events, TARGET_MANIFEST_BATCH_BYTES);
 		for (const batch of batches) {
 			for (const event of batch) {
 				if (event.kind !== 'file') continue;
@@ -184,7 +185,7 @@ export class QuarkSyncService {
 			for (const manifestFile of await this.client.listDirectory(deviceFolder.fid)) {
 				if (manifestFile.isDirectory) throw new Error('夸克事件目录结构异常，已暂停同步');
 				if (!MANIFEST_NAME.test(manifestFile.name)) throw new Error('夸克事件目录包含未知文件，已暂停同步');
-				if (manifestFile.size > MAX_FILE_BYTES) throw new Error('夸克清单超过 10 MiB，已暂停同步');
+				if (manifestFile.size > MAX_MANIFEST_BYTES) throw new Error('夸克清单超过 10 MiB，已暂停同步');
 				const bytes = await this.client.downloadFile(manifestFile);
 				const manifest = await parseBatchManifest(bytes, layout.vaultId, manifestFile.name);
 				if (manifest.deviceId !== deviceFolder.name) throw new Error('清单设备与目录不匹配，已暂停同步');
@@ -404,7 +405,7 @@ function splitEvents(events: VersionEvent[], maxBytes: number): VersionEvent[][]
 		} else {
 			current = proposed;
 		}
-		if (new TextEncoder().encode(JSON.stringify({ schema: 1, events: current })).byteLength > MAX_FILE_BYTES) {
+		if (new TextEncoder().encode(JSON.stringify({ schema: 1, events: current })).byteLength > MAX_MANIFEST_BYTES) {
 			throw new Error(`单条版本记录超过清单大小上限：${event.path}`);
 		}
 	}

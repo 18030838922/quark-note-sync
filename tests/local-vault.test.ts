@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { App } from 'obsidian';
 import { CONFLICT_DIRECTORY, LocalVaultAdapter } from '../src/local-vault.ts';
+import { createBatchManifest, parseBatchManifest } from '../src/manifest.ts';
+import { buildSyncPlan } from '../src/sync-engine.ts';
 
 const asApp = (vault: unknown): App => ({ vault } as App);
 
@@ -78,4 +80,42 @@ test('scan excludes indexed Quark downloads but retains ordinary attachments bes
 	const scan = await new LocalVaultAdapter(app).scan('.obsidian', new Set([managed.path]));
 	assert.deepEqual(scan.files.map((file) => file.path), [ordinary.path]);
 	assert.deepEqual(scan.presentPaths, [ordinary.path]);
+});
+
+test('an 11 MiB attachment can be scanned, recorded in sync history, and written on another device', async () => {
+	const bytes = new Uint8Array(11 * 1024 * 1024);
+	bytes[bytes.length - 1] = 42;
+	const file = { path: 'large.bin', stat: { size: bytes.byteLength }, extension: 'bin' };
+	const configDir = '.obsidian';
+	const sender = new LocalVaultAdapter(asApp({
+		getFiles: () => [file],
+		readBinary: async () => bytes.buffer,
+	}));
+	const scan = await sender.scan(configDir);
+	assert.equal(scan.files[0]?.size, bytes.byteLength);
+	const plan = await buildSyncPlan({
+		localFiles: scan.files,
+		presentPaths: scan.presentPaths,
+		protectedPaths: scan.protectedPaths,
+		snapshots: {},
+		remoteEvents: [],
+		configDir,
+		deviceId: 'sender',
+		now: 1,
+	});
+	const manifest = await createBatchManifest('vault-id', 'sender', plan.events);
+	const { events } = await parseBatchManifest(manifest.bytes, 'vault-id', `${manifest.batchId}.json`);
+	assert.equal(events[0].size, bytes.byteLength);
+
+	let written: Uint8Array | undefined;
+	const receiver = new LocalVaultAdapter(asApp({
+		getAbstractFileByPath: () => null,
+		adapter: { exists: async () => false },
+		createBinary: async (path: string, content: ArrayBuffer) => {
+			assert.equal(path, events[0].path);
+			written = new Uint8Array(content);
+		},
+	}));
+	await receiver.write(events[0].path, bytes, configDir);
+	assert.deepEqual(written, bytes);
 });

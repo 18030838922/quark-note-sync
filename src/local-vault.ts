@@ -1,5 +1,5 @@
 import type { App, TAbstractFile, TFile, TFolder } from 'obsidian';
-import { isSyncablePath, MAX_FILE_BYTES, validatePathSet, validateVaultPath } from './core.ts';
+import { isSyncablePath, validatePathSet, validateVaultPath } from './core.ts';
 import { sha256Hex } from './hash.ts';
 import type { LocalFileState } from './sync-engine.ts';
 
@@ -36,17 +36,13 @@ export class LocalVaultAdapter {
 				isWithinDirectory(file.path, CONFLICT_DIRECTORY)
 			) continue;
 			presentPaths.push(file.path);
-			if (file.stat.size > MAX_FILE_BYTES) {
-				protectedPaths.set(file.path, '文件超过 10 MiB，已跳过且不会同步删除');
-				continue;
-			}
 			if (!isSyncablePath(file.path, file.stat.size, configDir)) {
 				protectedPaths.set(file.path, '路径或文件大小不符合同步规则，已跳过');
 				continue;
 			}
 			try {
 				const bytes = toBytes(await this.app.vault.readBinary(file));
-				if (bytes.byteLength !== file.stat.size || bytes.byteLength > MAX_FILE_BYTES) {
+				if (bytes.byteLength !== file.stat.size) {
 					protectedPaths.set(file.path, '读取期间文件大小发生变化，已跳过');
 					continue;
 				}
@@ -87,7 +83,6 @@ export class LocalVaultAdapter {
 		const relative = allowConflict ? relativeConflictPath(path) : path;
 		validateVaultPath(relative);
 		if (!allowConflict) validatePathSet([path], configDir);
-		if (bytes.byteLength > MAX_FILE_BYTES) throw new Error(`本地写入超过 10 MiB：${path}`);
 		if (allowConflict) {
 			if (await this.app.vault.adapter.exists(path)) throw new Error(`冲突副本路径已出现：${path}`);
 			await this.ensureParentFolders(path, true);
