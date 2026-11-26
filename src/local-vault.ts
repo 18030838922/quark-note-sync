@@ -23,13 +23,13 @@ export class LocalVaultAdapter {
 		this.app = app;
 	}
 
-	async scan(configDir: string, managedPaths: ReadonlySet<string> = new Set()): Promise<LocalScan> {
+	async scan(configDir: string, managedPaths: ReadonlySet<string> = new Set(), onlyPath?: string): Promise<LocalScan> {
 		const managedPathKeys = new Set([...managedPaths].map(pathKey));
 		const files: LocalFileState[] = [];
 		const presentPaths: string[] = [];
 		const protectedPaths = new Map<string, string>();
 		for (const file of this.app.vault.getFiles()) {
-			if (managedPathKeys.has(pathKey(file.path))) continue;
+			if ((onlyPath !== undefined && file.path !== onlyPath) || managedPathKeys.has(pathKey(file.path))) continue;
 			if (
 				isWithinDirectory(file.path, configDir) ||
 				isWithinDirectory(file.path, '.trash') ||

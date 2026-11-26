@@ -75,6 +75,8 @@ export interface QuarkDashboardActions {
 	syncScope?: () => void;
 	versionHistory?: () => void;
 	manageReferences?: () => void | Promise<void>;
+	offlineStorage?: () => void;
+	resolveConflicts?: () => void;
 	retryPath?: (path: string) => void | Promise<void>;
 	openFile?: (path: string) => void | Promise<void>;
 	close?: () => void;
@@ -391,6 +393,8 @@ export class QuarkDashboardSidebar extends ItemView {
 		const tools = this.root.createDiv({ cls: 'quark-dashboard-secondary-actions' });
 		this.actionButton(tools, english ? 'Sync scope' : '同步范围', 'quark-dashboard-button-secondary', 'syncScope', 'filter', true);
 		this.actionButton(tools, english ? 'Version history' : '版本历史', 'quark-dashboard-button-secondary', 'versionHistory', 'history', true);
+		this.actionButton(tools, english ? 'Offline storage' : '离线空间', 'quark-dashboard-button-secondary', 'offlineStorage', 'hard-drive');
+		this.actionButton(tools, english ? 'Resolve conflicts' : '处理冲突', 'quark-dashboard-button-secondary', 'resolveConflicts', 'git-merge', true);
 		this.actionButton(tools, english ? 'Quark references' : '网盘引用', 'quark-dashboard-button-secondary', 'manageReferences', 'link');
 	}
 
@@ -694,7 +698,8 @@ export class QuarkDashboardSidebar extends ItemView {
 			for (const item of plan.paths.slice(0, 5)) {
 				const row = list.createEl('li', { cls: 'quark-dashboard-plan-row' });
 				row.createEl('code', { cls: 'quark-dashboard-plan-path', text: item.path, attr: { title: item.path } });
-				const action = item.result.deleted ? text.planDeleted : item.result.winner ? text.planApply : text.planNoFinal;
+				const action = item.deferred ? this.view.language === 'en' ? 'Cloud only · download on demand' : '仅云端 · 按需下载'
+					: item.result.deleted ? text.planDeleted : item.result.winner ? text.planApply : text.planNoFinal;
 				const conflicts = item.result.conflictCopies.length;
 				row.createSpan({ cls: 'quark-dashboard-plan-result', text: conflicts ? `${action} · ${text.planConflicts(formatInteger(conflicts, this.view.language))}` : action });
 			}

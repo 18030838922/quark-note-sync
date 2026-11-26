@@ -24,11 +24,19 @@ Vault usage comes from the file sizes Obsidian has indexed. The dashboard does n
 - The dashboard shows the current file and transfer progress. Upload progress updates per completed part. On mobile, download progress updates when the native bridge returns the file. To retry a failed path, select **Retry file** in the sync details. The plugin rechecks the current local and cloud versions before retrying that file.
 - Right-click a synced file and choose **View Quark version history**. You can compare earlier text versions with the current note, restore a copy, or explicitly restore at the original path. Use **Version history** on the dashboard to find files deleted through sync.
 
+### On-demand attachments and conflict resolution
+
+Open **Offline storage** and turn on **Download attachments on demand** on the devices where you want to save space. After a sync, new cloud-only attachments appear in the panel with their filename and size. In a note’s Reading View, unresolved links to those attachments also show a download button. Use **Keep offline** to download and pin a file. The panel lists the space used by managed local copies, related notes, and when each copy was last opened. Local removal preserves the cloud file and is available for unchanged copies.
+
+Multipart uploads keep confirmed parts on this device in Obsidian’s secret storage. Retrying identical content under the same account and destination resumes those parts when Quark still recognizes the upload task. An expired task restarts. Downloads retry from the beginning.
+
+Open **Resolve conflicts** to compare local content with the active cloud versions. You can keep one version or choose sections of a text merge. Confirming writes a new sync version linked to the reviewed branches, so earlier versions remain available in history.
+
 ## Use Quark files in notes
 
 Right-click in a note and select **Insert Quark Drive file**. You can also run it from the command palette on desktop or mobile. Browse your drive, then choose **Insert link only** or **Download to vault and insert**. Both actions write the same Markdown link. The private link opens on another device after you sign in with the same Quark account.
 
-In Reading View and Live Preview, personal images and audio load when their links come into view. For images, the plugin first tries Quark’s image preview, which can work when downloading the original fails. PDF and plain-text links open in a main workspace tab.
+In Reading View and Live Preview, personal images and audio load when their links come into view. For images, the plugin first tries Quark’s image preview, which can work when downloading the original fails. PDF and plain-text links open in a main workspace tab. On mobile, the PDF preview supports page jumps, zoom, and fit-to-width. Reopening a PDF restores its reading position on the same device.
 
 For personal videos and supported public shares, select **Play from Quark** to stream the video in Obsidian. Streaming can play videos larger than 50 MiB and lets you seek while the player loads segments. Windows playback has been verified. Android and iOS/iPadOS playback still needs device testing. If the player or stream is unavailable, you can open Quark to watch.
 

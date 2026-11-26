@@ -1,7 +1,8 @@
 import { selectQuarkVideoStream } from './video-stream-url.ts';
 import { sniffPayloadMime } from './share-api.ts';
 import { hasAsciiControl } from './core.ts';
-import { md5Base64, md5Hex, sha1Hex } from './hash.ts';
+import { md5Base64, md5Hex, sha1Hex, sha256Hex } from './hash.ts';
+import { readUploadCheckpoint, type UploadCheckpoint, type UploadCheckpointStore } from './upload-checkpoint.ts';
 import type { HttpRequest, HttpResponse } from './transport';
 import { classifyQuarkUrl, QuarkTransportError } from './transport.ts';
 
@@ -11,6 +12,7 @@ const PAGE_SIZE = 50;
 const MAX_PAGES = 10000;
 const OSS_USER_AGENT = 'aliyun-sdk-js/6.6.1';
 const QUARK_WEB_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const activeUploads = new Map<string, Promise<void>>();
 
 export interface HttpRequester {
 	request(request: HttpRequest): Promise<HttpResponse>;
@@ -46,6 +48,12 @@ export class QuarkAuthenticationError extends Error {
 	}
 }
 
+class UploadCheckpointExpiredError extends Error {
+	constructor() {
+		super('夸克分片上传任务已失效，请重新上传');
+	}
+}
+
 interface ApiEnvelope {
 	code?: number | string;
 	message?: string;
@@ -57,8 +65,9 @@ interface ApiEnvelope {
 export class QuarkClient {
 	private readonly transport: HttpRequester;
 	private cookie: string;
+	private accountId: string | null | undefined;
 
-	constructor(transport: HttpRequester, cookie: string) {
+	constructor(transport: HttpRequester, cookie: string, private readonly uploadCheckpoints?: UploadCheckpointStore) {
 		this.transport = transport;
 		this.cookie = cookie;
 	}
@@ -85,6 +94,7 @@ export class QuarkClient {
 		}));
 		if (!Array.isArray(drive.list)) throw new Error('Cookie 已登录，但夸克目录读取失败');
 		const accountId = readAccountId(accountInfo) ?? readCookieValue(this.cookie, '__uid');
+		this.accountId = accountId ?? null;
 		const nickname = readAccountNickname(accountInfo);
 		return {
 			...(accountId ? { accountId } : {}),
@@ -198,11 +208,86 @@ export class QuarkClient {
 	}
 
 	async uploadFile(parentId: string, name: string, content: Uint8Array, onProgress?: (sentBytes: number) => void): Promise<RemoteFile> {
+		const key = await this.uploadCheckpointKey(parentId, name, content);
+		if (!key) return this.uploadFileWithCheckpoint(parentId, name, content, key, onProgress);
+
+		const previous = activeUploads.get(key) ?? Promise.resolve();
+		const upload = previous.then(() => this.uploadFileWithCheckpoint(parentId, name, content, key, onProgress));
+		const settled = upload.then(() => undefined, () => undefined);
+		activeUploads.set(key, settled);
+		try {
+			return await upload;
+		} finally {
+			if (activeUploads.get(key) === settled) activeUploads.delete(key);
+		}
+	}
+
+	private async uploadFileWithCheckpoint(
+		parentId: string, name: string, content: Uint8Array, key: string, onProgress?: (sentBytes: number) => void,
+	): Promise<RemoteFile> {
 		const existing = await this.findChildByName(parentId, name);
+		if (existing && (existing.isDirectory || existing.size !== content.byteLength)) {
+			throw new Error(`夸克中同名文件大小不符：${name}`);
+		}
+		const checkpoint = await this.loadUploadCheckpoint(key, content.byteLength);
 		if (existing) {
-			if (existing.isDirectory || existing.size !== content.byteLength) throw new Error(`夸克中同名文件大小不符：${name}`);
+			if (checkpoint) await this.saveUploadCheckpoint(key, null);
+			onProgress?.(content.byteLength);
 			return existing;
 		}
+
+		if (checkpoint) {
+			try {
+				const uploaded = await this.uploadMultipart(parentId, name, content, checkpoint, onProgress);
+				await this.saveUploadCheckpoint(key, null);
+				return uploaded;
+			} catch (error) {
+				if (!(error instanceof UploadCheckpointExpiredError)) throw error;
+				const completed = await this.findChildByName(parentId, name);
+				if (completed) {
+					if (completed.isDirectory || completed.size !== content.byteLength || (checkpoint.fileId && completed.fid !== checkpoint.fileId)) {
+						throw new Error(`夸克上传后的文件校验失败：${name}`);
+					}
+					await this.saveUploadCheckpoint(key, null);
+					onProgress?.(content.byteLength);
+					return completed;
+				}
+				await this.saveUploadCheckpoint(key, null);
+				onProgress?.(0);
+			}
+		}
+		return this.startUpload(parentId, name, content, key, onProgress);
+	}
+
+	private async uploadCheckpointKey(parentId: string, name: string, content: Uint8Array): Promise<string> {
+		if (!this.uploadCheckpoints || content.byteLength < 2) return '';
+		const accountId = this.accountId === undefined ? await this.checkConnection() : this.accountId;
+		if (!accountId) return '';
+		const identity = JSON.stringify([accountId, parentId, name, content.byteLength, await sha256Hex(content)]);
+		return sha256Hex(new TextEncoder().encode(identity));
+	}
+
+	private async loadUploadCheckpoint(key: string, size: number): Promise<UploadCheckpoint | undefined> {
+		if (!key || !this.uploadCheckpoints) return undefined;
+		try {
+			const checkpoint = readUploadCheckpoint(await this.uploadCheckpoints.get(key), key, size);
+			if (checkpoint && buildUploadHost(checkpoint.bucket, checkpoint.uploadHost) === checkpoint.uploadHost) return checkpoint;
+		} catch {
+			// A missing or unreadable device checkpoint does not block a fresh upload.
+		}
+		return undefined;
+	}
+
+	private async saveUploadCheckpoint(key: string, checkpoint: UploadCheckpoint | null): Promise<void> {
+		if (!key || !this.uploadCheckpoints) return;
+		try {
+			await this.uploadCheckpoints.set(key, checkpoint && { ...checkpoint, etags: [...checkpoint.etags] });
+		} catch {
+			// The active task can continue when device storage is unavailable.
+		}
+	}
+
+	private async startUpload(parentId: string, name: string, content: Uint8Array, key: string, onProgress?: (sentBytes: number) => void): Promise<RemoteFile> {
 		const now = Date.now();
 		const pre = asRecord(await this.requestApi(`${DRIVE_API}/file/upload/pre`, 'POST', {}, {
 			ccp_hash_update: true,
@@ -218,14 +303,11 @@ export class QuarkClient {
 		}));
 		const preFid = firstString(pre.fid, pre.file_id);
 		if (isFinished(pre)) {
-			return this.finalizeInstantUpload(
-				parentId,
-				name,
-				content.byteLength,
-				firstString(pre.task_id),
-				firstString(pre.obj_key),
-				preFid,
+			const uploaded = await this.finalizeInstantUpload(
+				parentId, name, content.byteLength, firstString(pre.task_id), firstString(pre.obj_key), preFid,
 			);
+			onProgress?.(content.byteLength);
+			return uploaded;
 		}
 		const taskId = requiredString(pre.task_id, '夸克预上传缺少 task_id');
 		const authInfo = requiredString(pre.auth_info, '夸克预上传缺少 auth_info');
@@ -234,30 +316,42 @@ export class QuarkClient {
 			md5: md5Hex(content),
 			sha1: await sha1Hex(content),
 		}));
-		const hashFid = firstString(hashReply.fid, hashReply.file_id, hashReply.file);
 		if (isFinished(hashReply)) {
-			return this.finalizeInstantUpload(
-				parentId,
-				name,
-				content.byteLength,
-				firstString(hashReply.task_id, taskId),
-				firstString(hashReply.obj_key, pre.obj_key),
-				hashFid,
+			const uploaded = await this.finalizeInstantUpload(
+				parentId, name, content.byteLength, firstString(hashReply.task_id, taskId),
+				firstString(hashReply.obj_key, pre.obj_key), firstString(hashReply.fid, hashReply.file_id, hashReply.file),
 			);
+			onProgress?.(content.byteLength);
+			return uploaded;
 		}
-		const objKey = requiredString(pre.obj_key, '夸克预上传缺少 obj_key');
+		const objectKey = requiredString(pre.obj_key, '夸克预上传缺少 obj_key');
 		const bucket = requiredString(pre.bucket, '夸克预上传缺少 bucket');
 		const uploadId = requiredString(pre.upload_id, '夸克预上传缺少 upload_id');
 		const uploadHost = buildUploadHost(bucket, String(pre.upload_url ?? 'pds.quark.cn'));
 		const partSize = readPositiveNumber(
 			asRecord(pre.metadata).part_size ?? pre.part_size ?? asRecord(pre.__envelope_metadata).part_size,
 		) ?? 4 * 1024 * 1024;
+		const callback = typeof pre.callback === 'string' ? pre.callback : JSON.stringify(pre.callback ?? {});
+		const checkpoint: UploadCheckpoint = {
+			version: 1, key: content.byteLength > partSize ? key : '', taskId, authInfo, objectKey, bucket, uploadId,
+			uploadHost, partSize, callback, fileId: preFid, etags: [], committed: false,
+		};
+		await this.saveUploadCheckpoint(checkpoint.key, checkpoint);
+		const uploaded = await this.uploadMultipart(parentId, name, content, checkpoint, onProgress);
+		await this.saveUploadCheckpoint(checkpoint.key, null);
+		return uploaded;
+	}
+
+	private async uploadMultipart(
+		parentId: string, name: string, content: Uint8Array, checkpoint: UploadCheckpoint, onProgress?: (sentBytes: number) => void,
+	): Promise<RemoteFile> {
+		const { taskId, authInfo, objectKey, bucket, uploadId, uploadHost, partSize, etags } = checkpoint;
 		const totalParts = Math.max(1, Math.ceil(content.byteLength / partSize));
-		const etags: string[] = [];
-		for (let partNumber = 1; partNumber <= totalParts; partNumber += 1) {
+		if (etags.length) onProgress?.(Math.min(etags.length * partSize, content.byteLength));
+		for (let partNumber = etags.length + 1; partNumber <= totalParts; partNumber += 1) {
 			const start = (partNumber - 1) * partSize;
 			const part = content.subarray(start, Math.min(start + partSize, content.byteLength));
-			const partUrl = buildPartUrl(uploadHost, objKey, partNumber, uploadId);
+			const partUrl = buildPartUrl(uploadHost, objectKey, partNumber, uploadId);
 			const date = new Date().toUTCString();
 			const authMeta = [
 				'PUT',
@@ -266,7 +360,7 @@ export class QuarkClient {
 				date,
 				`x-oss-date:${date}`,
 				`x-oss-user-agent:${OSS_USER_AGENT}`,
-				`/${bucket}/${objKey}?partNumber=${partNumber}&uploadId=${uploadId}`,
+				`/${bucket}/${objectKey}?partNumber=${partNumber}&uploadId=${uploadId}`,
 			].join('\n');
 			const auth = asRecord(await this.requestApi(`${DRIVE_API}/file/upload/auth`, 'POST', {}, {
 				task_id: taskId,
@@ -288,17 +382,28 @@ export class QuarkClient {
 					'x-oss-user-agent': OSS_USER_AGENT,
 				},
 			});
-			if (uploaded.status !== 200) throw new Error(`夸克对象存储上传失败（HTTP ${uploaded.status}）`);
+			assertUploadStatus(uploaded, false);
 			const etag = uploaded.headers.etag?.replace(/^"|"$/g, '');
-			if (!etag || !/^[a-f\d]+$/i.test(etag)) throw new Error('夸克对象存储未返回有效 ETag');
+			if (!etag || !/^[a-f\d]{1,128}$/i.test(etag)) throw new Error('夸克对象存储未返回有效 ETag');
 			etags.push(etag);
+			await this.saveUploadCheckpoint(checkpoint.key, checkpoint);
 			onProgress?.(start + part.byteLength);
 		}
 
+		if (!checkpoint.committed) {
+			await this.completeMultipartUpload(checkpoint);
+			checkpoint.committed = true;
+			await this.saveUploadCheckpoint(checkpoint.key, checkpoint);
+		}
+		await this.requestApi(`${DRIVE_API}/file/upload/finish`, 'POST', {}, { task_id: taskId, obj_key: objectKey });
+		return this.confirmUploaded(parentId, name, content.byteLength, checkpoint.fileId);
+	}
+
+	private async completeMultipartUpload(checkpoint: UploadCheckpoint): Promise<void> {
+		const { taskId, authInfo, objectKey, bucket, uploadId, uploadHost, callback, etags } = checkpoint;
 		const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<CompleteMultipartUpload>\n${etags.map((etag, index) => `<Part><PartNumber>${index + 1}</PartNumber><ETag>"${etag}"</ETag></Part>`).join('\n')}\n</CompleteMultipartUpload>`;
 		const xmlBytes = new TextEncoder().encode(xml);
 		const contentMd5 = md5Base64(xmlBytes);
-		const callback = typeof pre.callback === 'string' ? pre.callback : JSON.stringify(pre.callback ?? {});
 		const callback64 = utf8ToBase64(callback);
 		const commitDate = new Date().toUTCString();
 		const commitMeta = [
@@ -309,7 +414,7 @@ export class QuarkClient {
 			`x-oss-callback:${callback64}`,
 			`x-oss-date:${commitDate}`,
 			`x-oss-user-agent:${OSS_USER_AGENT}`,
-			`/${bucket}/${objKey}?uploadId=${uploadId}`,
+			`/${bucket}/${objectKey}?uploadId=${uploadId}`,
 		].join('\n');
 		const commitAuth = asRecord(await this.requestApi(`${DRIVE_API}/file/upload/auth`, 'POST', {}, {
 			task_id: taskId,
@@ -318,7 +423,7 @@ export class QuarkClient {
 		}));
 		const commitKey = requiredString(commitAuth.auth_key, '夸克合并授权响应缺少 auth_key');
 		const commit = await this.transport.request({
-			url: `${uploadHost}/${encodeObjectKey(objKey)}?uploadId=${encodeURIComponent(uploadId)}`,
+			url: `${uploadHost}/${encodeObjectKey(objectKey)}?uploadId=${encodeURIComponent(uploadId)}`,
 			method: 'POST',
 			purpose: 'upload',
 			body: xmlBytes,
@@ -333,9 +438,7 @@ export class QuarkClient {
 				'x-oss-user-agent': OSS_USER_AGENT,
 			},
 		});
-		if (![200, 203].includes(commit.status)) throw new Error(`夸克对象存储合并失败（HTTP ${commit.status}）`);
-		await this.requestApi(`${DRIVE_API}/file/upload/finish`, 'POST', {}, { task_id: taskId, obj_key: objKey });
-		return this.confirmUploaded(parentId, name, content.byteLength, preFid);
+		assertUploadStatus(commit, true);
 	}
 
 	async getVideoStream(file: RemoteFile): Promise<string> {
@@ -517,7 +620,13 @@ export class QuarkClient {
 			throw new Error('连接夸克失败；请检查网络、Cookie 和 Obsidian 版本');
 		}
 		if (response.status === 401 || response.status === 403) throw new QuarkAuthenticationError(response.status);
-		if (response.status < 200 || response.status >= 300) throw new Error(`夸克请求失败（HTTP ${response.status}）`);
+		const checksUploadTask = url.pathname.endsWith('/file/upload/auth') || url.pathname.endsWith('/file/upload/finish');
+		if (response.status < 200 || response.status >= 300) {
+			if (checksUploadTask && [400, 404, 409, 410].includes(response.status) && hasExpiredUploadTask(parseUploadError(response))) {
+				throw new UploadCheckpointExpiredError();
+			}
+			throw new Error(`夸克请求失败（HTTP ${response.status}）`);
+		}
 		let envelope: ApiEnvelope;
 		try {
 			envelope = JSON.parse(response.text()) as ApiEnvelope;
@@ -529,6 +638,7 @@ export class QuarkClient {
 		if (semanticStatus === 401 || semanticStatus === 403 || Number(envelope.code) === 401 || Number(envelope.code) === 403) {
 			throw new QuarkAuthenticationError(semanticStatus === 401 || semanticStatus === 403 ? semanticStatus : Number(envelope.code));
 		}
+		if (checksUploadTask && hasExpiredUploadTask(envelope)) throw new UploadCheckpointExpiredError();
 		if (envelope.success === false) throw new Error('夸克 API 返回失败状态');
 		const allowedAccountInfoStatus = isAccountInfo && [0, 200, 2000000].includes(semanticStatus ?? NaN);
 		if (semanticStatus !== undefined && (semanticStatus < 0 || semanticStatus >= 400) && !allowedAccountInfoStatus) {
@@ -548,6 +658,31 @@ export class QuarkClient {
 		}
 		return payload;
 	}
+}
+
+function assertUploadStatus(response: HttpResponse, completing: boolean): void {
+	if (response.status === 200 || (completing && response.status === 203)) return;
+	const xmlCode = /<Code>\s*([A-Za-z]+)\s*<\/Code>/i.exec(new TextDecoder().decode(response.data.subarray(0, 2048)))?.[1];
+	if ((response.status === 404 && xmlCode === 'NoSuchUpload')
+		|| (completing && response.status === 400 && xmlCode === 'InvalidPart')) {
+		throw new UploadCheckpointExpiredError();
+	}
+	throw new Error(`夸克对象存储${completing ? '合并' : '上传'}失败（HTTP ${response.status}）`);
+}
+
+function parseUploadError(response: HttpResponse): Record<string, unknown> {
+	try {
+		return asRecord(JSON.parse(response.text()));
+	} catch {
+		return {};
+	}
+}
+
+function hasExpiredUploadTask(value: Record<string, unknown>): boolean {
+	const code = typeof value.code === 'string' ? value.code : '';
+	if (/^(?:NoSuchUpload|UploadTaskExpired|UploadTaskNotFound)$/i.test(code)) return true;
+	return [value.message, value.msg].some((message) => typeof message === 'string'
+		&& /^(?:upload task (?:has expired|expired|not found)|上传任务(?:已)?(?:过期|失效|不存在))[。.!]?$/i.test(message.trim()));
 }
 
 const DOWNLOAD_FAILURES = new Map([

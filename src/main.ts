@@ -9,6 +9,7 @@ import {
 	Platform,
 	Plugin,
 	PluginSettingTab,
+	getLinkpath,
 	requireApiVersion,
 	Setting,
 	MarkdownView,
@@ -55,12 +56,21 @@ import { sha256Hex } from './hash.ts';
 import { createReferenceLivePreview } from './live-preview.ts';
 import { normalizeSyncScope, type SyncScope } from './sync-scope.ts';
 import { SyncScopeModal } from './sync-scope-modal.ts';
+import { findDeferredAttachment, normalizeCloudAttachments, type CloudAttachmentIndex } from './cloud-attachments.ts';
+import { OfflineStorageModal, type OfflineStorageEntry } from './offline-storage.ts';
+import { ConflictResolutionModal } from './conflict-resolution.ts';
+import { collectNoteReferences, indexLocalCopies, publicShareReferenceKey } from './reference-manager.ts';
+import type { PdfReadingPosition } from './pdf-preview.ts';
 
 const PLUGIN_ID = 'quark-note-sync';
 const DEFAULT_CLOUD_DIRECTORY = 'Obsidian Notes';
 const DEFAULT_AUTO_SYNC_MINUTES = 5;
 
 interface PluginSettings {
+	attachmentsOnDemand: boolean;
+	cloudAttachments: CloudAttachmentIndex;
+	offlineAccess: Record<string, number>;
+	pdfPositions: Record<string, PdfReadingPosition>;
 	syncScope: SyncScope;
 	directoryShortcuts: Record<string, PersonalDirectoryShortcuts>;
 	language: Language;
@@ -95,12 +105,14 @@ interface DashboardPreview {
 	directory: string;
 	credentialRevision: number;
 	syncScope: SyncScope;
+	attachmentsOnDemand: boolean;
 }
 
 type AccountView = { state: 'signed-out' | 'expired' } | { state: 'connected'; label: string };
 
 export default class QuarkNoteSyncPlugin extends Plugin {
 	private config!: PluginSettings;
+	private settingsWrites = Promise.resolve();
 	private busy = false;
 	private unloading = false;
 	private autoSyncTimer: number | undefined;
@@ -182,6 +194,20 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 			name: this.config.language === 'en' ? 'Manage Quark references' : '管理网盘引用',
 			callback: () => void this.openReferenceManager(),
 		});
+		this.addCommand({
+			id: 'quark-offline-storage',
+			name: this.config.language === 'en' ? 'On-demand attachments and offline storage' : '按需附件与离线空间',
+			callback: () => this.openOfflineStorage(),
+		});
+		this.addCommand({
+			id: 'resolve-quark-conflicts',
+			name: this.config.language === 'en' ? 'Resolve Quark sync conflicts' : '处理夸克同步冲突',
+			callback: () => this.openConflictResolution(),
+		});
+		this.registerEvent(this.app.workspace.on('file-open', (file) => {
+			if (!file) return;
+			if (this.config.cloudAttachments[file.path] || managedDownloadPaths(this.config.sourceIndex).has(file.path)) this.recordOfflineAccess(file.path);
+		}));
 		this.registerEvent(this.app.workspace.on('file-menu', (menu, file) => {
 			if (!this.app.vault.getFileByPath(file.path)) return;
 			menu.addItem((item) => item
@@ -194,6 +220,7 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		this.registerMarkdownPostProcessor((element, context) => {
 			const inlineMedia = new QuarkInlineMediaChild(element);
 			context.addChild(inlineMedia);
+			this.renderDeferredAttachmentLinks(element, context.sourcePath, inlineMedia);
 			for (const anchor of Array.from(element.querySelectorAll<HTMLAnchorElement>('a[href]'))) {
 				const rawUrl = anchor.href;
 				if (anchor.dataset.quarkShareHandler !== '1') {
@@ -512,7 +539,9 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 			try {
 				const result = await this.createShareClient().previewDocumentOrImage(session, file);
 				const kind: PreviewKind = result.mimeType === 'application/pdf' ? 'document' : 'image';
-				await this.openPreviewTab(createPreviewPayload(file.name, kind, result.bytes, result.mimeType, undefined, officialUrl));
+				const payload = createPreviewPayload(file.name, kind, result.bytes, result.mimeType, undefined, officialUrl);
+				await this.openPreviewTab(kind === 'document'
+					? this.withPdfReadingPosition(payload, `${await publicShareReferenceKey(session.pwdId)}/${file.fid}`) : payload);
 				return;
 			} catch {
 				// Use the original share link when Quark restricts the preview.
@@ -793,7 +822,12 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 			return createPreviewPayload(file.name, kind, bytes, mimeType);
 		}
 		const bytes = await client.downloadFile(file, maxBytes);
-		return createPreviewPayload(file.name, kind, bytes, mimeTypeForFile(file.name));
+		const mimeType = mimeTypeForFile(file.name);
+		const payload = createPreviewPayload(file.name, kind, bytes, mimeType,
+			mimeType === 'application/pdf' ? () => this.downloadPersonalFile(file) : undefined);
+		const account = this.config.boundAccountId;
+		return account && mimeType === 'application/pdf'
+			? this.withPdfReadingPosition(payload, `${await accountReferenceKey(account)}/${file.fid}`) : payload;
 	}
 
 	private findIndexedSource(accountKey: string, fid: string): SourceIndexEntry | undefined {
@@ -820,7 +854,9 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 			}
 			const bytes = new Uint8Array(await this.app.vault.readBinary(file));
 			if (bytes.byteLength > preview.maxBytes || await sha256Hex(bytes) !== source.sha256) return false;
-			const payload = createPreviewPayload(source.name, preview.kind, bytes, mimeTypeForFile(source.name));
+			const payload = this.withPdfReadingPosition(
+				createPreviewPayload(source.name, preview.kind, bytes, mimeTypeForFile(source.name)), `${source.accountKey}/${source.fid}`);
+			this.recordOfflineAccess(source.localPath);
 			if (showInlineMedia && (preview.kind === 'image' || preview.kind === 'audio' || preview.kind === 'video')) showInlineMedia(payload);
 			else await this.openPreviewTab(payload);
 			return true;
@@ -959,6 +995,8 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 			syncScope: () => this.openSyncScope(),
 			versionHistory: () => this.openVersionHistory(),
 			manageReferences: () => this.openReferenceManager(),
+			offlineStorage: () => this.openOfflineStorage(),
+			resolveConflicts: () => this.openConflictResolution(),
 			retryPath: (path) => this.retrySyncFile(path),
 			login: state !== 'connected' ? () => this.openQrLogin() : undefined,
 			exportPairing: !mobile && state === 'connected' ? () => new ExportPairingModal(this.app, this).open() : undefined,
@@ -1272,6 +1310,204 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		new Notice(`自动同步间隔已设为 ${this.config.autoSyncIntervalMinutes} 分钟`);
 	}
 
+	private renderDeferredAttachmentLinks(element: HTMLElement, sourcePath: string, child: QuarkInlineMediaChild): void {
+		if (!Object.keys(this.config.cloudAttachments).length) return;
+		for (const target of element.querySelectorAll<HTMLElement>('a.internal-link[data-href], .internal-embed[src]')) {
+			if (target.dataset.quarkDeferred === '1') continue;
+			const href = target.getAttribute('data-href') ?? target.getAttribute('src');
+			if (!href) continue;
+			const link = getLinkpath(href);
+			const path = findDeferredAttachment(this.config.cloudAttachments, link, sourcePath);
+			if (!path || this.app.metadataCache.getFirstLinkpathDest(link, sourcePath)) continue;
+			target.dataset.quarkDeferred = '1';
+			const bytes = this.config.cloudAttachments[path].size;
+			const label = this.config.language === 'en' ? 'Download attachment' : '下载附件';
+			const button = createEl('button', { cls: 'quark-deferred-download', text: `${label} · ${(bytes / (1024 * 1024)).toFixed(2)} MiB`, attr: { type: 'button' } });
+			target.after(button);
+			child.trackCleanup(() => { button.remove(); delete target.dataset.quarkDeferred; });
+			const openAttachment = (event: MouseEvent) => {
+				event.preventDefault();
+				event.stopPropagation();
+				if (button.disabled) return;
+				button.disabled = true;
+				void this.fetchCloudAttachment(path, false).then(async (downloaded) => {
+					if (downloaded && !this.unloading && button.isConnected) {
+						await this.app.workspace.openLinkText(path + href.slice(link.length), sourcePath, 'tab');
+						button.remove();
+					}
+				}).catch(() => new Notice(this.config.language === 'en' ? 'Could not open attachment.' : '无法打开附件。')).finally(() => {
+					button.disabled = false;
+				});
+			};
+			child.onClick(button, openAttachment);
+			if (target.matches('a.internal-link')) child.onClick(target, openAttachment);
+		}
+	}
+
+	private async fetchCloudAttachment(path: string, pin: boolean): Promise<boolean> {
+		return (await this.runExclusive('下载同步附件', async () => {
+			try {
+				await this.createService(this.requireCookie()).downloadAttachment(path, pin, (progress) => this.reportTransferProgress(progress));
+				if (!this.unloading) new Notice(this.config.language === 'en' ? 'Attachment downloaded.' : '附件已下载。');
+				return true;
+			} finally { this.transferProgress = undefined; }
+		}, true)) === true;
+	}
+
+	private openOfflineStorage(): void {
+		new OfflineStorageModal(this.app, {
+			language: this.config.language,
+			enabled: () => this.config.attachmentsOnDemand,
+			setEnabled: async (enabled) => (await this.runExclusive('保存附件设置', async () => {
+				const prior = this.config.attachmentsOnDemand;
+				this.config.attachmentsOnDemand = enabled;
+				this.dashboardPreview = undefined;
+				try { await this.persistData(); } catch (error) { this.config.attachmentsOnDemand = prior; throw error; }
+				return true;
+			})) === true,
+			list: async () => this.listOfflineStorage(),
+			open: async ({ path }) => {
+				await this.runExclusive('打开离线文件', async () => {
+					const file = this.app.vault.getFileByPath(path);
+					if (!file) throw new Error('本地副本已不存在');
+					await this.app.workspace.getLeaf('tab').openFile(file);
+				});
+			},
+			get: async ({ path }, pin) => { await this.fetchCloudAttachment(path, pin); },
+			pin: async ({ path }, pinned) => {
+				await this.runExclusive('更改离线保留', async () => {
+					const entry = this.config.cloudAttachments[path];
+					if (!entry) throw new Error('附件已不在列表中');
+					this.config.cloudAttachments[path] = { ...entry, pinned };
+					try { await this.persistData(); } catch (error) { this.config.cloudAttachments[path] = entry; throw error; }
+				});
+			},
+			remove: async (entry) => {
+				await this.runExclusive('移除本地副本', async () => {
+					if (entry.kind === 'attachment') {
+						await this.createService(this.requireCookie()).evictAttachment(entry.path);
+					} else {
+						const source = Object.values(this.config.sourceIndex).find((record) => record.localPath === entry.path);
+						if (!source) throw new Error('此文件已不在离线副本索引中');
+						// Keep the reservation: a retry or another sync must never upload a managed Quark copy.
+						await new LocalVaultAdapter(this.app).trash(entry.path, this.app.vault.configDir, source.sha256);
+					}
+				}, entry.kind === 'attachment');
+			},
+		}).open();
+	}
+
+	private async listOfflineStorage(): Promise<OfflineStorageEntry[]> {
+		const entries = new Map<string, OfflineStorageEntry>();
+		const copies = indexLocalCopies(this.config.sourceIndex, (path) => this.app.vault.getFileByPath(path)?.stat.size);
+		const notesByPath = new Map<string, Set<string>>();
+		const addNote = (path: string, note: string) => {
+			const prior = notesByPath.get(path);
+			if (prior) prior.add(note);
+			else notesByPath.set(path, new Set([note]));
+		};
+		for (const source of Object.values(this.config.sourceIndex)) {
+			const file = this.app.vault.getFileByPath(source.localPath);
+			if (file) entries.set(file.path, {
+				path: file.path, size: file.stat.size, kind: 'quark', local: true, pinned: false,
+				lastOpened: this.config.offlineAccess[file.path], notes: [],
+			});
+		}
+		for (const [path, attachment] of Object.entries(this.config.cloudAttachments)) {
+			if (entries.has(path)) continue;
+			const file = this.app.vault.getFileByPath(path);
+			entries.set(path, {
+				path, size: file?.stat.size ?? attachment.size, kind: 'attachment', local: Boolean(file),
+				pinned: attachment.pinned, lastOpened: this.config.offlineAccess[path], notes: [],
+			});
+		}
+		if (!entries.size) return [];
+		for (const file of this.app.vault.getMarkdownFiles()) {
+			const metadata = this.app.metadataCache.getFileCache(file);
+			for (const record of [...metadata?.links ?? [], ...metadata?.embeds ?? []]) {
+				const link = getLinkpath(record.link);
+				const dest = this.app.metadataCache.getFirstLinkpathDest(link, file.path);
+				const path = dest?.path ?? findDeferredAttachment(this.config.cloudAttachments, link, file.path, false);
+				if (path && entries.has(path)) addNote(path, file.path);
+			}
+			if (!copies.size) continue;
+			try {
+				for (const reference of await collectNoteReferences(file.path, await this.app.vault.cachedRead(file), copies)) {
+					for (const copy of reference.localCopies) addNote(copy.localPath, file.path);
+				}
+			} catch { /* A note may have been removed while listing offline copies. */ }
+		}
+		return [...entries.values()].map((row) => ({ ...row, notes: [...notesByPath.get(row.path) ?? []].sort() }))
+			.sort((left, right) => Number(right.local) - Number(left.local) || right.size - left.size);
+	}
+
+	private recordOfflineAccess(path: string): void {
+		const at = Date.now();
+		if (this.unloading || at - (this.config.offlineAccess[path] ?? 0) < 60_000) return;
+		const access = this.config.offlineAccess;
+		access[path] = at;
+		const paths = Object.keys(access);
+		if (paths.length > 2000) {
+			const oldest = paths.sort((left, right) => access[left] - access[right])[0];
+			delete access[oldest];
+		}
+		void this.persistData().catch(() => {});
+	}
+
+	private withPdfReadingPosition(payload: PreviewPayload, key: string): PreviewPayload {
+		if (payload.mimeType !== 'application/pdf') return payload;
+		return {
+			...payload,
+			pdfPosition: this.config.pdfPositions[key],
+			onPdfPositionChange: (position) => {
+				if (this.unloading) return;
+				const entries = this.config.pdfPositions;
+				const previous = entries[key];
+				if (previous?.page === position.page && previous.zoom === position.zoom) return;
+				delete entries[key];
+				entries[key] = position;
+				const keys = Object.keys(entries);
+				if (keys.length > 200) delete entries[keys[0]];
+				void this.persistData().catch(() => {});
+			},
+		};
+	}
+
+	private openConflictResolution(): void {
+		const directory = this.config.cloudDirectoryName;
+		const revision = this.credentialRevision;
+		const service = () => {
+			if (directory !== this.config.cloudDirectoryName || revision !== this.credentialRevision) {
+				throw new Error('账号或云端目录已变化，请重新打开冲突列表');
+			}
+			return this.createService(this.requireCookie());
+		};
+		new ConflictResolutionModal(this.app, {
+			language: this.config.language,
+			listConflicts: async () => {
+				const rows = await this.runExclusive('读取冲突', async () => service().listConflicts(), true);
+				if (!rows) throw new Error('暂时无法读取同步冲突');
+				return rows;
+			},
+			previewConflict: async (path, version) => {
+				const preview = await this.runExclusive('预览冲突', async () => {
+					await this.historyEditor(path)?.save();
+					return await service().previewConflict(path, version);
+				}, true);
+				if (!preview) throw new Error('暂时无法预览冲突');
+				return preview;
+			},
+			applyResolution: async (request) => {
+				const succeeded = await this.runExclusive('保存冲突处理结果', async () => {
+					await service().resolveConflict(request, async () => { await this.historyEditor(request.path)?.save(); });
+					this.dashboardPreview = undefined;
+					return true;
+				}, true);
+				if (!succeeded) throw new Error('冲突未处理，请刷新后重试');
+			},
+		}).open();
+	}
+
 	private async openReferenceManager(): Promise<void> {
 		await this.runExclusive('打开网盘引用', async () => {
 			const existing = this.app.workspace.getLeavesOfType(QUARK_REFERENCE_MANAGER_VIEW_TYPE)[0];
@@ -1478,7 +1714,7 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		this.dashboardPreview = undefined;
 		const plan = await this.readSyncPreview(confirm);
 		if (!plan || this.dashboard !== dashboard || this.unloading) return;
-		this.dashboardPreview = { plan, confirm, directory, credentialRevision, syncScope };
+		this.dashboardPreview = { plan, confirm, directory, credentialRevision, syncScope, attachmentsOnDemand: this.config.attachmentsOnDemand };
 		this.redrawDashboard();
 	}
 
@@ -1497,7 +1733,7 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		const preview = this.dashboardPreview;
 		if (!preview?.confirm || this.busy || this.unloading) return;
 		this.dashboardPreview = undefined;
-		if (!this.isCurrentSyncPreview(preview.directory, preview.credentialRevision, preview.syncScope)) {
+		if (!this.isCurrentSyncPreview(preview.directory, preview.credentialRevision, preview.syncScope, preview.attachmentsOnDemand)) {
 			this.redrawDashboard();
 			return;
 		}
@@ -1505,8 +1741,8 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		if (summary) void this.refreshDashboard(false);
 	}
 
-	private isCurrentSyncPreview(directory: string, credentialRevision: number, syncScope: SyncScope): boolean {
-		if (directory === this.config.cloudDirectoryName && credentialRevision === this.credentialRevision && syncScope === this.config.syncScope) return true;
+	private isCurrentSyncPreview(directory: string, credentialRevision: number, syncScope: SyncScope, attachmentsOnDemand = this.config.attachmentsOnDemand): boolean {
+		if (directory === this.config.cloudDirectoryName && credentialRevision === this.credentialRevision && syncScope === this.config.syncScope && attachmentsOnDemand === this.config.attachmentsOnDemand) return true;
 		new Notice(this.config.language === 'en'
 			? 'The cloud folder, session, or sync scope changed. Preview again before syncing.'
 			: '云端目录、登录状态或同步范围已更改，请重新预览后再同步。');
@@ -1526,10 +1762,11 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		const directory = this.config.cloudDirectoryName;
 		const credentialRevision = this.credentialRevision;
 		const syncScope = this.config.syncScope;
+		const attachmentsOnDemand = this.config.attachmentsOnDemand;
 		const plan = await this.readSyncPreview(true);
 		if (!plan || this.unloading) return;
 		new PlanModal(this.app, plan, true, () => {
-			if (this.isCurrentSyncPreview(directory, credentialRevision, syncScope)) void this.performSync(true);
+			if (this.isCurrentSyncPreview(directory, credentialRevision, syncScope, attachmentsOnDemand)) void this.performSync(true);
 		}).open();
 	}
 
@@ -1703,6 +1940,7 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 			snapshots: this.config.snapshots,
 			pendingApplies: this.config.pendingApplies,
 			sourceIndex: this.config.sourceIndex,
+			cloudAttachments: this.config.cloudAttachments,
 			persist: async () => {
 				if (this.unloading) throw new Error('插件已卸载，已停止后续同步操作');
 				await this.persistData();
@@ -1717,7 +1955,17 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 				if (this.unloading) throw new Error('插件已卸载，已停止后续夸克请求');
 				return await transport.request(request);
 			},
-		}, cookie);
+		}, cookie, {
+			get: (key) => {
+				try {
+					const raw = this.app.secretStorage.getSecret(`${PLUGIN_ID}-upload-${key}`);
+					return raw ? JSON.parse(raw) as unknown : undefined;
+				} catch { return undefined; }
+			},
+			set: (key, value) => {
+				this.app.secretStorage.setSecret(`${PLUGIN_ID}-upload-${key}`, value ? JSON.stringify(value) : '');
+			},
+		});
 	}
 
 	private createTransport(): QuarkTransport {
@@ -1816,28 +2064,36 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		}, this.config.autoSyncIntervalMinutes * 60_000);
 	}
 
-	private async persistData(): Promise<void> {
-		if (this.unloading) return;
-		await this.saveData({
-			language: this.config.language,
-			syncScope: this.config.syncScope,
-			directoryShortcuts: this.config.directoryShortcuts,
-			cloudDirectoryName: this.config.cloudDirectoryName,
-			deviceName: this.config.deviceName,
-			autoSync: this.config.autoSync,
-			syncOnStartup: this.config.syncOnStartup,
-			sessionExpired: this.config.sessionExpired,
-			autoSyncIntervalMinutes: this.config.autoSyncIntervalMinutes,
-			initialSyncCompleted: this.config.initialSyncCompleted,
-			lastSummary: this.config.lastSummary,
-			lastSyncedAt: this.config.lastSyncedAt,
-			deviceId: this.config.deviceId,
-			boundAccountId: this.config.boundAccountId,
-			boundRootFid: this.config.boundRootFid,
-			snapshots: this.config.snapshots,
-			pendingApplies: this.config.pendingApplies,
-			sourceIndex: this.config.sourceIndex,
+	private persistData(): Promise<void> {
+		const write = this.settingsWrites.then(async () => {
+			if (this.unloading) return;
+			await this.saveData({
+				language: this.config.language,
+				syncScope: this.config.syncScope,
+				attachmentsOnDemand: this.config.attachmentsOnDemand,
+				cloudAttachments: this.config.cloudAttachments,
+				offlineAccess: this.config.offlineAccess,
+				pdfPositions: this.config.pdfPositions,
+				directoryShortcuts: this.config.directoryShortcuts,
+				cloudDirectoryName: this.config.cloudDirectoryName,
+				deviceName: this.config.deviceName,
+				autoSync: this.config.autoSync,
+				syncOnStartup: this.config.syncOnStartup,
+				sessionExpired: this.config.sessionExpired,
+				autoSyncIntervalMinutes: this.config.autoSyncIntervalMinutes,
+				initialSyncCompleted: this.config.initialSyncCompleted,
+				lastSummary: this.config.lastSummary,
+				lastSyncedAt: this.config.lastSyncedAt,
+				deviceId: this.config.deviceId,
+				boundAccountId: this.config.boundAccountId,
+				boundRootFid: this.config.boundRootFid,
+				snapshots: this.config.snapshots,
+				pendingApplies: this.config.pendingApplies,
+				sourceIndex: this.config.sourceIndex,
+			});
 		});
+		this.settingsWrites = write.catch(() => {});
+		return write;
 	}
 }
 
@@ -2384,7 +2640,7 @@ class PlanModal extends Modal {
 		});
 		contentEl.createEl('p', { text: `待发布版本：${this.plan.events.length}；待检查路径：${this.plan.paths.length}；跳过：${this.plan.skipped.length}` });
 		const changes = this.plan.paths.map((item) => {
-			const action = item.result.deleted ? '远端为删除版本' : item.result.winner ? '检查/应用远端版本' : '无最终版本';
+			const action = item.deferred ? '仅保留云端附件信息，可按需下载' : item.result.deleted ? '远端为删除版本' : item.result.winner ? '检查/应用远端版本' : '无最终版本';
 			const conflictCount = item.result.conflictCopies.length;
 			return `${item.path} — ${action}${conflictCount ? `；冲突副本 ${conflictCount} 个` : ''}`;
 		});
@@ -2521,6 +2777,10 @@ function normalizeSettings(data: PersistedData): PluginSettings {
 	return {
 		language: data.language === 'en' ? 'en' : 'zh-CN',
 		syncScope: normalizeSyncScope(data.syncScope),
+		attachmentsOnDemand: data.attachmentsOnDemand === true,
+		cloudAttachments: normalizeCloudAttachments(data.cloudAttachments),
+		offlineAccess: normalizeOfflineAccess(data.offlineAccess),
+		pdfPositions: normalizePdfPositions(data.pdfPositions),
 		directoryShortcuts: normalizeDirectoryShortcutAccounts(data.directoryShortcuts),
 		cloudDirectoryName: directory,
 		deviceName,
@@ -2541,6 +2801,28 @@ function normalizeSettings(data: PersistedData): PluginSettings {
 		pendingApplies: normalizePendingApplies(data.pendingApplies),
 		sourceIndex: normalizeSourceIndex(data.sourceIndex),
 	};
+}
+
+function normalizeOfflineAccess(value: unknown): Record<string, number> {
+	const result = emptyMap<number>();
+	if (!value || typeof value !== 'object' || Array.isArray(value)) return result;
+	const entries = Object.entries(value).slice(-2000);
+	for (const [path, time] of entries) {
+		if (typeof time === 'number' && Number.isSafeInteger(time) && time > 0 && time <= 8.64e15) result[path] = time;
+	}
+	return result;
+}
+
+function normalizePdfPositions(value: unknown): Record<string, PdfReadingPosition> {
+	const result = emptyMap<PdfReadingPosition>();
+	if (!value || typeof value !== 'object' || Array.isArray(value)) return result;
+	for (const [key, position] of Object.entries(value).slice(-200)) {
+		if (!/^[a-f0-9]{64}\/[\w-]{1,512}$/i.test(key) || !position || typeof position !== 'object') continue;
+		const { page, zoom } = position as Partial<PdfReadingPosition>;
+		if (typeof page === 'number' && Number.isSafeInteger(page) && page > 0 &&
+			typeof zoom === 'number' && zoom >= 1 && zoom <= 3) result[key] = { page, zoom };
+	}
+	return result;
 }
 
 function normalizeDirectoryShortcutAccounts(input: unknown): Record<string, PersonalDirectoryShortcuts> {

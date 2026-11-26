@@ -890,6 +890,84 @@
 	width: 100%;
 }
 
+.quark-pdf-toolbar {
+	align-items: center;
+	background: var(--background-primary);
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px 12px;
+	justify-content: space-between;
+	padding: 7px 0;
+	position: sticky;
+	top: 0;
+	z-index: 1;
+}
+
+.quark-pdf-controls {
+	align-items: center;
+	display: flex;
+	flex-wrap: wrap;
+	gap: 4px;
+	margin: 0;
+}
+
+.quark-pdf-controls button,
+.quark-pdf-controls .quark-pdf-page-input {
+	min-height: 44px;
+}
+
+.quark-pdf-controls button {
+	min-width: 44px;
+	padding-inline: 8px;
+}
+
+.quark-pdf-controls .quark-pdf-page-input {
+	font-size: 16px;
+	padding-inline: 4px;
+	text-align: center;
+	width: 3.5em;
+}
+
+.quark-pdf-controls span {
+	color: var(--text-muted);
+	font-variant-numeric: tabular-nums;
+	white-space: nowrap;
+}
+
+.quark-pdf-zoom-value {
+	min-width: 4ch;
+}
+
+.quark-pdf-status:not(.quark-pdf-status-visible) {
+	clip-path: inset(50%);
+	height: 1px;
+	overflow: hidden;
+	position: absolute;
+	white-space: nowrap;
+	width: 1px;
+}
+
+.quark-pdf-status-visible {
+	flex-basis: 100%;
+}
+
+.quark-pdf-viewport {
+	margin-top: 8px;
+	overflow-x: auto;
+	overscroll-behavior-x: contain;
+}
+
+.quark-pdf-canvas {
+	background: white;
+	display: block;
+	height: auto;
+	max-width: none;
+}
+
+.quark-pdf-canvas[hidden] {
+	display: none;
+}
+
 .quark-preview-text {
 	background: var(--background-secondary);
 	border: 1px solid var(--background-modifier-border);
@@ -1042,4 +1120,57 @@
 
 .quark-dashboard-transfer p {
 	overflow-wrap: anywhere;
+}
+
+
+.quark-conflict-modal {
+	width: min(1000px, 94vw);
+}
+
+.quark-conflict-columns {
+	display: grid;
+	gap: 12px;
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.quark-conflict-column {
+	min-width: 0;
+}
+
+.quark-conflict-controls {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+}
+
+.quark-conflict-choice {
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-m);
+	padding: 10px;
+}
+
+.quark-conflict-picker {
+	max-width: 100%;
+}
+
+.quark-conflict-meta {
+	color: var(--text-muted);
+	overflow-wrap: anywhere;
+}
+
+.quark-offline-file {
+	border-block-end: 1px solid var(--background-modifier-border);
+	padding-block: 12px;
+}
+
+.quark-offline-file strong {
+	overflow-wrap: anywhere;
+}
+
+.quark-offline-file p {
+	margin-block: 5px 8px;
+}
+
+.quark-deferred-download {
+	margin-inline: 5px;
 }

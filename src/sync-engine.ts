@@ -19,6 +19,7 @@ export interface PlanInput {
 	snapshots: Record<string, SyncSnapshot>;
 	remoteEvents: VersionEvent[];
 	managedPaths?: readonly string[];
+	deferredAttachments?: ReadonlySet<string>;
 	deviceId: string;
 	now: number;
 	configDir: string;
@@ -29,6 +30,7 @@ export interface PlannedPath {
 	result: ResolvedPath;
 	expectedLocalHash: string | null;
 	localPresent: boolean;
+	deferred?: boolean;
 	localEvents: VersionEvent[];
 	nextSnapshot: SyncSnapshot;
 }
@@ -132,7 +134,7 @@ export async function buildSyncPlan(input: PlanInput): Promise<SyncPlan> {
 		let shouldRecord = false;
 		if (!previous) {
 			if (local && remoteState?.winner?.sha256 !== local.sha256) shouldRecord = true;
-		} else if (localHash !== previous.hash) {
+		} else if (localHash !== previous.hash && (local || !input.deferredAttachments?.has(path))) {
 			const alreadyRepresented = remoteState?.heads.some((event) =>
 				local ? event.kind === 'file' && event.sha256 === local.sha256 : event.kind === 'delete',
 			) ?? false;

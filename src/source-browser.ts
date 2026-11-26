@@ -1,5 +1,6 @@
 import { mountQuarkVideo, type VideoStream } from './video-stream.ts';
-import { ItemView, Notice, type WorkspaceLeaf } from 'obsidian';
+import { ItemView, Notice, Platform, type WorkspaceLeaf } from 'obsidian';
+import { mountMobilePdfPreview, type PdfReadingPosition } from './pdf-preview.ts';
 import type { RemoteDirectoryPage, RemoteFile } from './quark-api.ts';
 import { parseOfficialShareUrl, type PreviewKind } from './quark-references.ts';
 import {
@@ -40,6 +41,8 @@ export interface PreviewPayload {
 	message?: string;
 	officialUrl?: string;
 	download?: () => Promise<void>;
+	pdfPosition?: PdfReadingPosition;
+	onPdfPositionChange?: (position: PdfReadingPosition) => void;
 }
 
 export interface QuarkBrowserActions {
@@ -657,6 +660,7 @@ export class QuarkBrowserView extends ItemView {
 export class QuarkPreviewView extends ItemView {
 	private payload: PreviewPayload | undefined;
 	private stopVideo?: () => void;
+	private stopPdf?: () => void;
 	private objectUrl: string | undefined;
 	private readonly getLanguage: () => 'zh-CN' | 'en';
 
@@ -739,6 +743,10 @@ export class QuarkPreviewView extends ItemView {
 			this.contentEl.createEl('p', { text: this.label('预览数据不可用。', 'Preview bytes are unavailable.') });
 			return;
 		}
+		if (Platform.isMobileApp && payload.kind === 'document' && payload.mimeType === 'application/pdf') {
+			this.renderMobilePdf(payload, payload.bytes);
+			return;
+		}
 		const buffer = payload.bytes.buffer.slice(payload.bytes.byteOffset, payload.bytes.byteOffset + payload.bytes.byteLength) as ArrayBuffer;
 		this.objectUrl = URL.createObjectURL(new Blob([buffer], { type: payload.mimeType }));
 		if (payload.kind === 'image') {
@@ -762,6 +770,17 @@ export class QuarkPreviewView extends ItemView {
 		}
 	}
 
+	private renderMobilePdf(payload: PreviewPayload, bytes: Uint8Array): void {
+		this.stopPdf = mountMobilePdfPreview(this.contentEl, bytes, this.getLanguage(), () => {
+			if (payload.download) {
+				this.addPreviewButton(this.contentEl, this.label('下载到夸克下载', 'Download to Quark Downloads'), () => void payload.download?.());
+			}
+			if (payload.officialUrl) {
+				this.addPreviewButton(this.contentEl, this.label('在夸克中打开', 'Open in Quark'), () => window.open(payload.officialUrl, '_blank', 'noopener'));
+			}
+		}, payload.pdfPosition, payload.onPdfPositionChange);
+	}
+
 	private addPreviewButton(container: HTMLElement, label: string, callback: () => void): void {
 		const button = container.createEl('button', { text: label });
 		button.setAttribute('type', 'button');
@@ -769,6 +788,8 @@ export class QuarkPreviewView extends ItemView {
 	}
 
 	private revokeObjectUrl(): void {
+		this.stopPdf?.();
+		this.stopPdf = undefined;
 		this.stopVideo?.();
 		this.stopVideo = undefined;
 		if (!this.objectUrl) return;

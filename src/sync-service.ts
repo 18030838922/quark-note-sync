@@ -1,5 +1,5 @@
 import type { App } from 'obsidian';
-import { validatePathSet, type VersionEvent } from './core.ts';
+import { resolvePathEvents, validatePathSet, type VersionEvent } from './core.ts';
 import { sha256Hex } from './hash.ts';
 import { LocalVaultAdapter, CONFLICT_DIRECTORY, type LocalScan } from './local-vault.ts';
 import { createBatchManifest, parseBatchManifest } from './manifest.ts';
@@ -9,6 +9,9 @@ import { recoverPendingApply } from './core.ts';
 import { applyIfCurrentHash } from './safe-apply.ts';
 import { managedDownloadPaths, type SourceIndex } from './source-index.ts';
 import { selectSyncScope, type ScopeSelection, type SyncScope } from './sync-scope.ts';
+import { isCloudAttachment, type CloudAttachment, type CloudAttachmentIndex } from './cloud-attachments.ts';
+import { findConflictBase, type ConflictPreview, type ConflictResolutionRequest, type SyncConflict } from './conflict-resolution-model.ts';
+import { canPreviewVersionText } from './version-history-model.ts';
 
 const CLOUD_DATA_DIRECTORY = 'Obsidian Sync Data';
 const CLOUD_BLOB_DIRECTORY = 'blobs';
@@ -20,6 +23,7 @@ const MAX_MANIFEST_BYTES = 10 * 1024 * 1024;
 export interface SyncSettingsView {
 	cloudDirectoryName: string;
 	syncScope?: SyncScope;
+	attachmentsOnDemand?: boolean;
 }
 
 export interface PendingApplyState {
@@ -33,6 +37,7 @@ export interface SyncStatePort {
 	snapshots: Record<string, SyncSnapshot>;
 	pendingApplies: Record<string, PendingApplyState>;
 	sourceIndex?: SourceIndex;
+	cloudAttachments?: CloudAttachmentIndex;
 	persist(): Promise<void>;
 }
 
@@ -105,6 +110,129 @@ export class QuarkSyncService {
 		return await this.downloadBlob({ ...layout, blobsFid: folder.fid }, event);
 	}
 
+	async listConflicts(): Promise<SyncConflict[]> {
+		const events = await this.versionHistory();
+		const groups = new Map<string, VersionEvent[]>();
+		for (const event of events) {
+			const group = groups.get(event.path);
+			if (group) group.push(event);
+			else groups.set(event.path, [event]);
+		}
+		const excluded = this.excludedPaths(events);
+		const results: SyncConflict[] = [];
+		for (const [path, history] of groups) {
+			if (excluded.has(path) || this.managedPaths().has(path) || this.state.cloudAttachments?.[path]?.deferred) continue;
+			try {
+				validatePathSet([path], this.app.vault.configDir);
+				const state = resolvePathEvents(history);
+				if (hasDistinctHeads(state.heads)) {
+					const localHash = this.state.snapshots[path]?.hash ?? state.winner?.sha256;
+					const cloudVersions = [...state.heads].sort((left, right) =>
+						Number(left.sha256 === localHash) - Number(right.sha256 === localHash));
+					results.push({ path, cloudVersions });
+				}
+			} catch {
+				// An incomplete history is reported by normal sync and is unsafe to resolve.
+			}
+		}
+		return results.sort((left, right) => left.path.localeCompare(right.path));
+	}
+
+	async previewConflict(path: string, versionId: string): Promise<ConflictPreview> {
+		const { layout, history, heads, chosen } = await this.readConflict(path, versionId);
+		const local = await this.local.read(path);
+		const previous = this.state.snapshots[path];
+		const localVersion = heads.find((event) => event.sha256 === local?.sha256 && event.id !== chosen.id) ??
+			history.find((event) => previous?.heads.includes(event.id) && event.sha256 === previous.hash && event.id !== chosen.id);
+		const base = localVersion ? findConflictBase(history, localVersion.id, chosen.id) : null;
+		const previewBytes = async (event: VersionEvent | null) => !event || event.size === undefined || !canPreviewVersionText(path, event.size)
+			? null : await this.downloadBlob(layout, event);
+		return {
+			path, headIds: heads.map((event) => event.id).sort(),
+			localHash: local?.sha256 ?? null,
+			localBytes: local && canPreviewVersionText(path, local.bytes.byteLength) ? local.bytes : null,
+			localSize: local?.bytes.byteLength,
+			cloudVersion: chosen,
+			cloudBytes: await previewBytes(chosen),
+			baseBytes: await previewBytes(base),
+		};
+	}
+
+	async resolveConflict(request: ConflictResolutionRequest, flushLocal: () => Promise<void>): Promise<void> {
+		const { path, cloudVersionId, expectedHeadIds, expectedLocalHash, choice } = request;
+		const verifyHeads = (heads: VersionEvent[]) => {
+			if (heads.map((event) => event.id).sort().join(',') !== [...expectedHeadIds].sort().join(',')) {
+				throw new Error('云端版本已变化，请重新预览冲突');
+			}
+		};
+		const first = await this.readConflict(path, cloudVersionId);
+		verifyHeads(first.heads);
+		await flushLocal();
+		const local = await this.local.read(path);
+		if ((local?.sha256 ?? null) !== expectedLocalHash) throw new Error('本地文件已变化，请重新预览冲突');
+		const bytes = choice.kind === 'local' ? local?.bytes
+			: choice.kind === 'merged' ? choice.bytes
+			: first.chosen.kind === 'file' ? await this.downloadBlob(first.layout, first.chosen) : undefined;
+		if (choice.kind === 'merged' && (!bytes || !canPreviewVersionText(path, bytes.byteLength))) throw new Error('合并后的文本超过支持的大小');
+		const hash = bytes ? await sha256Hex(bytes) : null;
+		if (bytes && hash) await this.ensureBlob(first.layout.blobsFid!, hash, bytes.byteLength, bytes);
+		// Preserve a local edit that has never been published before replacing it.
+		const unpublished = local && local.sha256 !== hash && !first.history.some((event) => event.sha256 === local.sha256)
+			? local : undefined;
+		if (unpublished) await this.ensureBlob(first.layout.blobsFid!, unpublished.sha256, unpublished.bytes.byteLength, unpublished.bytes);
+		const layout = await this.ensureCloudLayout();
+		if (layout.vaultId !== first.layout.vaultId) throw new Error('夸克同步目录已变化');
+		const current = await this.readConflict(path, cloudVersionId);
+		verifyHeads(current.heads);
+		if (current.layout.vaultId !== layout.vaultId) throw new Error('夸克同步目录已变化');
+		await flushLocal();
+		if (await this.local.currentHash(path) !== expectedLocalHash) throw new Error('本地文件已变化，请重新预览冲突');
+		const batch: VersionEvent[] = [];
+		const parents = [...expectedHeadIds].sort();
+		const createdAt = Date.now();
+		if (unpublished) {
+			batch.push(await makeSyncEvent({
+				path, kind: 'file', parents, sha256: unpublished.sha256, size: unpublished.bytes.byteLength,
+				deviceId: this.state.deviceId, createdAt,
+			}));
+		}
+		const event = await makeSyncEvent({
+			path,
+			kind: bytes ? 'file' : 'delete',
+			parents: batch.length ? [batch[0].id] : parents,
+			...(bytes && hash ? { sha256: hash, size: bytes.byteLength } : {}),
+			deviceId: this.state.deviceId,
+			createdAt,
+		});
+		batch.push(event);
+		await this.publishBatch(layout, batch);
+		const result = resolvePathEvents([...current.history, ...batch]);
+		const applied = await this.applyPath(layout, {
+			path, result, localEvents: [event], expectedLocalHash,
+			localPresent: expectedLocalHash !== null,
+			nextSnapshot: { hash, heads: [event.id] },
+		}, undefined, flushLocal);
+		if (applied === 'skipped') throw new Error('云端已保存合并版本，本地改动仍然保留，请重新同步');
+		if (this.state.cloudAttachments?.[path]) {
+			if (bytes && hash) await this.setAttachment(path, { ...this.state.cloudAttachments[path], size: bytes.byteLength, sha256: hash, deferred: false });
+			else await this.setAttachment(path, undefined);
+		}
+	}
+
+	private async readConflict(path: string, versionId: string): Promise<{ layout: CloudLayout; history: VersionEvent[]; heads: VersionEvent[]; chosen: VersionEvent }> {
+		validatePathSet([path], this.app.vault.configDir);
+		await this.client.checkConnection();
+		const remote = await this.readRemoteContext();
+		if (!remote.layout || this.excludedPaths(remote.events).has(path) || this.managedPaths().has(path) || this.state.cloudAttachments?.[path]?.deferred) {
+			throw new Error('此文件不在当前设备的同步范围内');
+		}
+		const history = remote.events.filter((event) => event.path === path);
+		const { heads } = resolvePathEvents(history);
+		const chosen = heads.find((event) => event.id === versionId);
+		if (!chosen || !hasDistinctHeads(heads)) throw new Error('冲突已变化，请刷新列表');
+		return { layout: await this.requireBlobFolder(remote.layout), history, heads, chosen };
+	}
+
 	async sync(selectedPath?: string, progress?: (state: SyncProgress) => void): Promise<SyncSummary> {
 		await this.client.checkConnection();
 		const layout = await this.ensureCloudLayout();
@@ -155,7 +283,13 @@ export class QuarkSyncService {
 			if (!selected(pathPlan.path) || failedUploads.has(pathPlan.path)) continue;
 			try {
 				progress?.({ path: pathPlan.path, phase: 'apply' });
+				if (pathPlan.deferred) {
+					const { path, result } = pathPlan;
+					await this.setAttachment(path, { size: result.winner!.size!, sha256: result.winner!.sha256!, deferred: true, pinned: false });
+					continue;
+				}
 				const result = await this.applyPath(layout, pathPlan, progress);
+				if (result !== 'skipped') await this.updateAttachment(pathPlan);
 				if (result === 'downloaded') downloaded += 1;
 				if (result === 'deleted') deleted += 1;
 				if (result !== 'skipped') conflicts += pathPlan.result.conflictCopies.length;
@@ -168,6 +302,85 @@ export class QuarkSyncService {
 			}
 		}
 		return { uploaded, downloaded, deleted, conflicts, skipped: dedupeSkipped(skipped) };
+	}
+
+	private shouldDeferAttachment(pathPlan: SyncPlan['paths'][number]): boolean {
+		const { path, result, localPresent } = pathPlan;
+		const index = this.state.cloudAttachments;
+		if (!this.settings.attachmentsOnDemand || !index || localPresent || !isCloudAttachment(path) ||
+			result.heads.length !== 1 || !result.winner?.sha256 || result.winner.size === undefined) return false;
+		const previous = index[path];
+		return !previous?.pinned && (previous?.deferred === true || !Object.prototype.hasOwnProperty.call(this.state.snapshots, path));
+	}
+
+	private async updateAttachment(pathPlan: SyncPlan['paths'][number]): Promise<void> {
+		const index = this.state.cloudAttachments;
+		const previous = index?.[pathPlan.path];
+		if (!previous) return;
+		const winner = pathPlan.result.winner;
+		if (!winner?.sha256 || winner.size === undefined) {
+			await this.setAttachment(pathPlan.path, undefined);
+		} else {
+			await this.setAttachment(pathPlan.path, { ...previous, deferred: false, size: winner.size, sha256: winner.sha256 });
+		}
+	}
+
+	async downloadAttachment(path: string, pin: boolean, progress?: (state: SyncProgress) => void): Promise<void> {
+		const { layout, plan, entry } = await this.readManagedAttachment(path);
+		let retained = { ...entry, pinned: entry.pinned || pin };
+		if (pin && !entry.pinned) await this.setAttachment(path, retained);
+		if (plan.localEvents.length || (plan.localPresent && plan.expectedLocalHash !== plan.result.winner?.sha256)) {
+			throw new Error('本地已有不同内容，请先用同步预览确认');
+		}
+		const result = await this.applyPath(layout, plan, progress);
+		if (result === 'skipped') throw new Error('本地文件已变化，请重试');
+		const winner = plan.result.winner!;
+		retained = { ...retained, size: winner.size!, sha256: winner.sha256!, deferred: false };
+		await this.setAttachment(path, retained);
+	}
+
+	async evictAttachment(path: string): Promise<void> {
+		if (!this.settings.attachmentsOnDemand) throw new Error('请先启用附件按需下载');
+		const { layout, plan, entry } = await this.readManagedAttachment(path);
+		const winner = plan.result.winner!;
+		if (!plan.localPresent || plan.localEvents.length || plan.expectedLocalHash !== winner.sha256) {
+			throw new Error('本地附件有未同步的改动，无法清理');
+		}
+		await this.downloadBlob(layout, winner);
+		// Persist the local-only removal intent before touching the vault. A retry cannot publish a tombstone.
+		await this.setAttachment(path, { size: winner.size!, sha256: winner.sha256!, deferred: true, pinned: false });
+		await this.local.trash(path, this.app.vault.configDir, plan.expectedLocalHash);
+	}
+
+	private async readManagedAttachment(path: string): Promise<{ layout: CloudLayout; plan: SyncPlan['paths'][number]; entry: CloudAttachment }> {
+		const entry = this.state.cloudAttachments?.[path];
+		if (!entry || !isCloudAttachment(path)) throw new Error('此附件不在按需下载列表中');
+		await this.client.checkConnection();
+		const remote = await this.readRemoteContext();
+		const scope = this.excludedPaths(remote.events);
+		const plan = (await this.makePlan(remote.events, scope, path)).paths.find((item) => item.path === path);
+		const winner = plan?.result.winner;
+		if (!plan || !remote.layout || plan.result.heads.length !== 1 || !winner?.sha256 || winner.size === undefined) {
+			throw new Error('此附件已删除、存在冲突或不在当前设备同步范围内');
+		}
+		const layout = await this.requireBlobFolder(remote.layout);
+		return { layout, plan, entry };
+	}
+
+	private async setAttachment(path: string, item: CloudAttachment | undefined): Promise<void> {
+		const index = this.state.cloudAttachments;
+		if (!index) return;
+		const prior = index[path];
+		if (prior?.sha256 === item?.sha256 && prior?.size === item?.size && prior?.deferred === item?.deferred && prior?.pinned === item?.pinned) return;
+		if (item) index[path] = item;
+		else delete index[path];
+		try {
+			await this.state.persist();
+		} catch (error) {
+			if (prior) index[path] = prior;
+			else delete index[path];
+			throw error;
+		}
 	}
 
 	private selectScope(scope: SyncScope, events: VersionEvent[]): ScopeSelection {
@@ -191,21 +404,26 @@ export class QuarkSyncService {
 		return new Set(this.selectScope(scope, events).excluded);
 	}
 
-	private async makePlan(remoteEvents: VersionEvent[], excluded: ReadonlySet<string>): Promise<SyncPlan> {
+	private async makePlan(remoteEvents: VersionEvent[], excluded: ReadonlySet<string>, scanPath?: string): Promise<SyncPlan> {
 		const managedPaths = this.managedPaths();
 		const excludedKeys = new Set([...excluded].map(pathKey));
-		const scan: LocalScan = await this.local.scan(this.app.vault.configDir, new Set([...managedPaths, ...excluded]));
-		return await buildSyncPlan({
+		const scan: LocalScan = await this.local.scan(this.app.vault.configDir, new Set([...managedPaths, ...excluded]), scanPath);
+		const plan = await buildSyncPlan({
 			localFiles: scan.files,
 			presentPaths: scan.presentPaths,
 			protectedPaths: scan.protectedPaths,
-			snapshots: Object.fromEntries(Object.entries(this.state.snapshots).filter(([path]) => !excludedKeys.has(pathKey(path)))),
-			remoteEvents: remoteEvents.filter((event) => !excludedKeys.has(pathKey(event.path))),
+			snapshots: Object.fromEntries(Object.entries(this.state.snapshots).filter(([path]) => (!scanPath || path === scanPath) && !excludedKeys.has(pathKey(path)))),
+			remoteEvents: remoteEvents.filter((event) => (!scanPath || event.path === scanPath) && !excludedKeys.has(pathKey(event.path))),
 			managedPaths: [...managedPaths],
+			deferredAttachments: new Set(Object.entries(this.state.cloudAttachments ?? {}).filter(([, item]) => item.deferred).map(([path]) => path)),
 			deviceId: this.state.deviceId,
 			now: Date.now(),
 			configDir: this.app.vault.configDir,
 		});
+		for (const path of plan.paths) {
+			if (this.shouldDeferAttachment(path)) path.deferred = true;
+		}
+		return plan;
 	}
 
 	private managedPaths(): Set<string> {
@@ -313,6 +531,7 @@ export class QuarkSyncService {
 		layout: CloudLayout,
 		pathPlan: SyncPlan['paths'][number],
 		progress?: (state: SyncProgress) => void,
+		flushLocal?: () => Promise<void>,
 	): Promise<'downloaded' | 'deleted' | 'unchanged' | 'skipped'> {
 		await this.validateApplyPaths(pathPlan);
 		this.state.pendingApplies[pathPlan.path] = {
@@ -337,6 +556,7 @@ export class QuarkSyncService {
 			await this.local.write(copyPath, bytes, this.app.vault.configDir, true);
 		}
 
+		await flushLocal?.();
 		const currentHash = await this.local.currentHash(pathPlan.path);
 		if (currentHash !== pathPlan.expectedLocalHash) {
 			await this.acknowledgeAndClearPending(pathPlan);
@@ -376,6 +596,7 @@ export class QuarkSyncService {
 			return 'unchanged';
 		}
 		const bytes = await this.downloadWithProgress(layout, winner, progress);
+		await flushLocal?.();
 		let written: boolean;
 		try {
 			written = await applyIfCurrentHash(
@@ -400,13 +621,25 @@ export class QuarkSyncService {
 		return await this.downloadBlob(layout, event, report);
 	}
 
-	private async downloadBlob(layout: CloudLayout, event: VersionEvent, onProgress?: (bytes: number) => void): Promise<Uint8Array> {
+	private async requireBlobFolder(layout: CloudLayout): Promise<CloudLayout> {
+		if (layout.blobsFid) return layout;
+		const folder = layout.dataFid ? await this.client.findChildByName(layout.dataFid, CLOUD_BLOB_DIRECTORY) : undefined;
+		if (!folder?.isDirectory) throw new Error('夸克同步内容目录不存在');
+		return { ...layout, blobsFid: folder.fid };
+	}
+
+	private async findBlob(layout: CloudLayout, event: VersionEvent) {
 		if (!event.sha256 || event.size === undefined || !layout.blobsFid) throw new Error('版本记录缺少内容摘要或大小');
 		const name = `${event.sha256}.bin`;
 		const blob = await this.client.findChildByName(layout.blobsFid, name);
 		if (!blob || blob.isDirectory || blob.size !== event.size) throw new Error(`夸克中缺少内容对象：${name}`);
+		return blob;
+	}
+
+	private async downloadBlob(layout: CloudLayout, event: VersionEvent, onProgress?: (bytes: number) => void): Promise<Uint8Array> {
+		const blob = await this.findBlob(layout, event);
 		const bytes = await this.client.downloadFile(blob, undefined, onProgress);
-		if (bytes.byteLength !== event.size || await sha256Hex(bytes) !== event.sha256) throw new Error(`夸克内容校验失败：${name}`);
+		if (bytes.byteLength !== event.size || await sha256Hex(bytes) !== event.sha256) throw new Error(`夸克内容校验失败：${blob.name}`);
 		return bytes;
 	}
 
@@ -454,6 +687,14 @@ export class QuarkSyncService {
 		}
 		if (changed) await this.state.persist();
 	}
+}
+
+async function makeSyncEvent(body: Omit<VersionEvent, 'id'>): Promise<VersionEvent> {
+	return { id: await sha256Hex(new TextEncoder().encode(JSON.stringify(body))), ...body };
+}
+
+function hasDistinctHeads(heads: readonly VersionEvent[]): boolean {
+	return new Set(heads.map((event) => event.kind === 'file' ? event.sha256 : 'deleted')).size > 1;
 }
 
 function pathKey(path: string): string {
