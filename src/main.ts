@@ -6,6 +6,7 @@ import {
 	Platform,
 	Plugin,
 	PluginSettingTab,
+	requireApiVersion,
 	Setting,
 	MarkdownView,
 	MarkdownRenderChild,
@@ -196,7 +197,7 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 				const reference = parsePersonalReference(image.getAttribute('src') ?? image.src);
 				if (!reference || image.dataset.quarkShareHandler === '1') continue;
 				image.dataset.quarkShareHandler = '1';
-				const button = image.ownerDocument.createDocumentFragment().createEl('button');
+				const button = createEl('button');
 				button.type = 'button';
 				button.className = 'quark-inline-load-button';
 				button.textContent = this.config.language === 'en' ? `Load ${image.alt || 'Quark image'}` : `加载${image.alt || '夸克图片'}`;
@@ -1622,7 +1623,7 @@ class QuarkSettingsTab extends PluginSettingTab {
 							dropdown.setDisabled(true);
 							const changed = await this.plugin.setLanguage(value);
 							if (changed && this.accountRow) {
-								if (typeof this.update === 'function') this.update();
+								if (requireApiVersion('1.13.0')) this.update();
 								else this.renderLegacySettings();
 							}
 							else dropdown.setValue(this.plugin.settingsView.language).setDisabled(false);
@@ -2378,9 +2379,8 @@ class QuarkInlineMediaChild extends MarkdownRenderChild {
 }
 
 function createInlineMedia(payload: PreviewPayload, owner: QuarkInlineMediaChild): HTMLElement | undefined {
-	const fragment = owner.containerEl.ownerDocument.createDocumentFragment();
 	if (payload.stream) {
-		const container = fragment.createEl('span');
+		const container = createSpan();
 		container.className = 'quark-live-reference';
 		owner.trackCleanup(mountQuarkVideo(container, payload.stream));
 		return container;
@@ -2390,13 +2390,13 @@ function createInlineMedia(payload: PreviewPayload, owner: QuarkInlineMediaChild
 	const url = URL.createObjectURL(new Blob([buffer], { type: payload.mimeType }));
 	owner.trackObjectUrl(url);
 	if (payload.kind === 'image') {
-		const image = fragment.createEl('img');
+		const image = createEl('img');
 		image.className = 'quark-inline-media-image';
 		image.alt = payload.name;
 		image.src = url;
 		return image;
 	}
-	const media = fragment.createEl(payload.kind === 'audio' ? 'audio' : 'video');
+	const media = createEl(payload.kind === 'audio' ? 'audio' : 'video');
 	media.className = `quark-inline-media-${payload.kind}`;
 	media.controls = true;
 	media.preload = 'none';

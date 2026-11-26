@@ -29,7 +29,7 @@ export function createReferenceLivePreview(options: ReferenceLivePreviewOptions)
 		}
 
 		toDOM(view: EditorView): HTMLElement {
-			const root = view.dom.ownerDocument.createDocumentFragment().createEl('span');
+			const root = view.dom.ownerDocument.adoptNode(createSpan());
 			root.className = 'quark-live-reference';
 			const button = root.createEl('button');
 			button.type = 'button';

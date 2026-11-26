@@ -9,7 +9,7 @@ export interface VideoStream {
 }
 
 export function mountQuarkVideo(container: HTMLElement, stream: VideoStream): () => void {
-	const video = container.ownerDocument.createDocumentFragment().createEl('video');
+	const video = createEl('video');
 	video.controls = true;
 	video.playsInline = true;
 	video.preload = 'none';
@@ -18,7 +18,7 @@ export function mountQuarkVideo(container: HTMLElement, stream: VideoStream): ()
 	button.type = 'button';
 	button.textContent = stream.language === 'en' ? 'Play from Quark' : '在线播放';
 	const status = container.createSpan({ attr: { role: 'status' } });
-	const fallback = container.ownerDocument.createDocumentFragment().createEl('a');
+	const fallback = createEl('a');
 	fallback.textContent = stream.language === 'en' ? 'Open Quark' : '打开夸克';
 	fallback.target = '_blank';
 	fallback.rel = 'noopener noreferrer';

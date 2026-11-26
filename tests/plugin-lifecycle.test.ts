@@ -134,6 +134,7 @@ async function loadPlugin(data: object, savedCookie: string | null = 'sid=fixtur
 		MarkdownView: class {},
 		MarkdownRenderChild: class {},
 		PluginSettingTab: SettingsTab,
+		requireApiVersion: () => false,
 		Setting,
 		ItemView: class {
 			containerEl = { addClass() {} };

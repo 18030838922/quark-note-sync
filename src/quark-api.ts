@@ -114,7 +114,8 @@ export class QuarkClient {
 		});
 		const candidates: unknown = Array.isArray(data) ? data : asRecord(data).list;
 		if (!Array.isArray(candidates)) throw new Error('夸克文件详情响应不完整');
-		const match = candidates.find((value) => String(asRecord(value).fid ?? '') === fid);
+		const entries: unknown[] = candidates;
+		const match = entries.map(asRecord).find((entry) => String(entry.fid ?? '') === fid);
 		if (!match) throw new Error('夸克中未找到此文件，或当前账号无权访问');
 		return normalizeRemoteFile(match);
 	}
@@ -617,8 +618,7 @@ function readPositiveNumber(value: unknown): number | undefined {
 
 function delay(milliseconds: number): Promise<void> {
 	return new Promise((resolve) => {
-		const timer = typeof window === 'undefined' ? globalThis : window;
-		timer.setTimeout(resolve, milliseconds);
+		window.setTimeout(resolve, milliseconds);
 	});
 }
 

@@ -1,7 +1,7 @@
 {
   "id": "quark-note-sync",
   "name": "Quark Note Sync",
-  "version": "0.5.5",
+  "version": "0.5.6",
   "minAppVersion": "1.11.4",
   "description": "Sync notes through Quark Drive on Windows, Android, and iOS.",
   "isDesktopOnly": false,
