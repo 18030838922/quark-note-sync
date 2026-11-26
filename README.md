@@ -20,6 +20,10 @@ Select the cloud icon in the left ribbon or run **Open sync dashboard** to show 
 
 Vault usage comes from the file sizes Obsidian has indexed. The dashboard does not read note contents. Quark storage is account-wide and is shown only when the drive reports valid totals.
 
+- **Sync scope** lets you include folders and file extensions and set an optional size limit on this device. Preview which paths would be included before saving. Files outside the scope stay where they are. Re-including a path resumes sync using its saved history.
+- The dashboard shows the current file and transfer progress. Upload progress updates per completed part. On mobile, download progress updates when the native bridge returns the file. To retry a failed path, select **Retry file** in the sync details. The plugin rechecks the current local and cloud versions before retrying that file.
+- Right-click a synced file and choose **View Quark version history**. You can compare earlier text versions with the current note, restore a copy, or explicitly restore at the original path. Use **Version history** on the dashboard to find files deleted through sync.
+
 ## Use Quark files in notes
 
 Right-click in a note and select **Insert Quark Drive file**. You can also run it from the command palette on desktop or mobile. Browse your drive, then choose **Insert link only** or **Download to vault and insert**. Both actions write the same Markdown link. The private link opens on another device after you sign in with the same Quark account.
@@ -31,6 +35,10 @@ For personal videos and supported public shares, select **Play from Quark** to s
 Paste an official `pan.quark.cn` share URL to browse shared folders, enter a passcode when required, and preview supported images, PDFs, and videos. Buffered previews are limited to 20 MiB for images and documents and 50 MiB for audio or video. Original-file downloads depend on Quark’s access rules.
 
 **Download to vault and insert** saves a local copy in `Quark Downloads/`. Personal downloads are capped at 100 MiB. The plugin uses that copy when available and syncs the note with its Quark link. It excludes files it downloaded and tracks from Quark sync, while ordinary attachments in the same folder remain eligible for sync. Save a copy to a regular attachment folder and link to it if you want to edit and sync the file itself.
+
+In the personal Drive browser, search by filename under the current folder or across the drive. Searches read folder pages in batches. You can continue if the first batch does not cover the whole scope. Favorite folders and recent folders are saved on this device for the current Quark account.
+
+Open **Quark references** from the dashboard to see which notes link to Quark and which references have local copies. Check links on demand and choose a replacement file for a selected reference. An unavailable account, missing passcode, or request failure can leave a link unverified.
 
 ## Install
 

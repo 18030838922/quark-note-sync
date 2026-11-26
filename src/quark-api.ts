@@ -26,6 +26,11 @@ export interface RemoteFile {
 	size: number;
 }
 
+export interface RemoteDirectoryPage {
+	entries: RemoteFile[];
+	total: number;
+}
+
 export interface StorageQuota {
 	totalBytes: number;
 	usedBytes: number;
@@ -125,32 +130,38 @@ export class QuarkClient {
 		const seen = new Set<string>();
 		let expectedTotal: number | undefined;
 		for (let page = 1; page <= MAX_PAGES; page += 1) {
-			const data = await this.requestApi(`${DRIVE_API}/file/sort`, 'GET', {
-				pdir_fid: parentId,
-				_page: String(page),
-				_size: String(PAGE_SIZE),
-				_sort: 'file_name:asc',
-				_fetch_total: '1',
-				_fetch_sub_dirs: '0',
-			});
-			const body = asRecord(data);
-			const list = body.list;
-			if (!Array.isArray(list)) throw new Error('夸克目录响应不完整，已暂停同步');
-			const total = readTotal(body);
-			if (total === undefined) throw new Error('夸克未返回总数，分页状态不完整，已暂停同步');
+			const { entries, total } = await this.listDirectorySearchPage(parentId, page);
 			if (expectedTotal === undefined) expectedTotal = total;
 			else if (expectedTotal !== total) throw new Error('夸克目录在分页期间发生变化，已暂停同步');
-			if (list.length > PAGE_SIZE || files.length + list.length > total) throw new Error('夸克分页数据不一致，已暂停同步');
-			for (const value of list) {
-				const file = normalizeRemoteFile(value);
+			if (files.length + entries.length > total) throw new Error('夸克分页数据不一致，已暂停同步');
+			for (const file of entries) {
 				if (seen.has(file.fid)) throw new Error('夸克分页返回重复文件编号，已暂停同步');
 				seen.add(file.fid);
 				files.push(file);
 			}
 			if (files.length === total) return files;
-			if (list.length === 0) throw new Error('夸克分页提前结束，已暂停同步');
+			if (entries.length === 0) throw new Error('夸克分页提前结束，已暂停同步');
 		}
 		throw new Error('夸克目录超过分页安全上限，已暂停同步');
+	}
+
+	async listDirectorySearchPage(parentId: string, page: number): Promise<RemoteDirectoryPage> {
+		if (!Number.isSafeInteger(page) || page < 1 || page > MAX_PAGES) throw new Error('夸克目录超出分页范围');
+		const data = await this.requestApi(`${DRIVE_API}/file/sort`, 'GET', {
+			pdir_fid: parentId,
+			_page: String(page),
+			_size: String(PAGE_SIZE),
+			_sort: 'file_name:asc',
+			_fetch_total: '1',
+			_fetch_sub_dirs: '0',
+		});
+		const body = asRecord(data);
+		const list = body.list;
+		if (!Array.isArray(list)) throw new Error('夸克目录响应不完整');
+		const total = readTotal(body);
+		if (total === undefined) throw new Error('夸克未返回总数，分页状态不完整');
+		if (list.length > PAGE_SIZE || list.length > total) throw new Error('夸克分页数据不一致');
+		return { entries: list.map(normalizeRemoteFile), total };
 	}
 
 	async findChildByName(parentId: string, name: string): Promise<RemoteFile | undefined> {
@@ -186,7 +197,7 @@ export class QuarkClient {
 		throw new Error(`夸克未确认目录创建成功：${name}`);
 	}
 
-	async uploadFile(parentId: string, name: string, content: Uint8Array): Promise<RemoteFile> {
+	async uploadFile(parentId: string, name: string, content: Uint8Array, onProgress?: (sentBytes: number) => void): Promise<RemoteFile> {
 		const existing = await this.findChildByName(parentId, name);
 		if (existing) {
 			if (existing.isDirectory || existing.size !== content.byteLength) throw new Error(`夸克中同名文件大小不符：${name}`);
@@ -281,6 +292,7 @@ export class QuarkClient {
 			const etag = uploaded.headers.etag?.replace(/^"|"$/g, '');
 			if (!etag || !/^[a-f\d]+$/i.test(etag)) throw new Error('夸克对象存储未返回有效 ETag');
 			etags.push(etag);
+			onProgress?.(start + part.byteLength);
 		}
 
 		const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<CompleteMultipartUpload>\n${etags.map((etag, index) => `<Part><PartNumber>${index + 1}</PartNumber><ETag>"${etag}"</ETag></Part>`).join('\n')}\n</CompleteMultipartUpload>`;
@@ -387,14 +399,14 @@ export class QuarkClient {
 		return { bytes, mimeType };
 	}
 
-	async downloadFile(file: RemoteFile, maxBytes?: number): Promise<Uint8Array> {
+	async downloadFile(file: RemoteFile, maxBytes?: number, onProgress?: (receivedBytes: number) => void): Promise<Uint8Array> {
 		if (maxBytes !== undefined && (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || file.size > maxBytes)) {
 			throw new Error(`夸克文件超过预览上限：${file.name}`);
 		}
-		let response = await this.requestDownload(file, maxBytes);
+		let response = await this.requestDownload(file, maxBytes, onProgress);
 		let failure = response.status === 403 ? readDownloadFailure(response.data) : undefined;
 		if (response.status === 403 && (!failure || failure.retryable)) {
-			response = await this.requestDownload(file, maxBytes);
+			response = await this.requestDownload(file, maxBytes, onProgress);
 			failure = response.status === 403 ? readDownloadFailure(response.data) : undefined;
 		}
 		if (response.status !== 200) {
@@ -405,7 +417,7 @@ export class QuarkClient {
 		return response.data;
 	}
 
-	private async requestDownload(file: RemoteFile, maxBytes?: number): Promise<HttpResponse> {
+	private async requestDownload(file: RemoteFile, maxBytes?: number, onProgress?: (receivedBytes: number) => void): Promise<HttpResponse> {
 		const data = await this.requestApi(`${DRIVE_API}/file/download`, 'POST', {}, { fids: [file.fid] });
 		const candidates: unknown = Array.isArray(data) ? data : asRecord(data).list;
 		const entries: unknown[] = Array.isArray(candidates) ? candidates : [];
@@ -421,6 +433,7 @@ export class QuarkClient {
 			cookie: this.cookie,
 			purpose: 'download',
 			responseKind: 'arraybuffer',
+			onDownloadProgress: onProgress,
 			...(maxBytes === undefined ? {} : { maxResponseBytes: maxBytes }),
 			headers: {
 				Accept: 'application/octet-stream,*/*',

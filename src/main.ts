@@ -1,5 +1,8 @@
 import { mountQuarkVideo } from './video-stream.ts';
-import { hasAsciiControl } from './core.ts';
+import { hasAsciiControl, validatePathSet, type VersionEvent } from './core.ts';
+import { LocalVaultAdapter } from './local-vault.ts';
+import { VersionHistoryModal } from './version-history.ts';
+import { canPreviewVersionText, listFileVersions, listRecoverableDeletedPaths, restoreVersionLocally } from './version-history-model.ts';
 import {
 	Modal,
 	Notice,
@@ -20,7 +23,7 @@ import {
 	type WorkspaceLeaf,
 } from 'obsidian';
 import QRCode from 'qrcode';
-import type { PendingApplyState, SyncSummary } from './sync-service.ts';
+import type { PendingApplyState, SyncProgress, SyncSummary } from './sync-service.ts';
 import { QuarkSyncService } from './sync-service.ts';
 import type { SyncPlan, SyncSnapshot } from './sync-engine.ts';
 import { QuarkAuthenticationError, QuarkClient, type RemoteFile } from './quark-api.ts';
@@ -37,21 +40,29 @@ import {
 	QUARK_PREVIEW_VIEW_TYPE,
 	QuarkBrowserView,
 	QuarkPreviewView,
+	normalizePersonalDirectoryShortcuts,
+	type PersonalDirectoryShortcuts,
 	type PreviewPayload,
 	type QuarkBrowserActions,
 	type ShareEntryLike,
 	type ShareSessionLike,
 	type SourceEditorTarget,
 } from './source-browser.ts';
-import { QuarkShareClient } from './share-api.ts';
+import { QuarkShareClient, ShareApiError } from './share-api.ts';
+import { QUARK_REFERENCE_MANAGER_VIEW_TYPE, QuarkReferenceManagerView } from './reference-manager-view.ts';
+import type { QuarkReferenceTarget, ReferenceStatus } from './reference-manager.ts';
 import { sha256Hex } from './hash.ts';
 import { createReferenceLivePreview } from './live-preview.ts';
+import { normalizeSyncScope, type SyncScope } from './sync-scope.ts';
+import { SyncScopeModal } from './sync-scope-modal.ts';
 
 const PLUGIN_ID = 'quark-note-sync';
 const DEFAULT_CLOUD_DIRECTORY = 'Obsidian Notes';
 const DEFAULT_AUTO_SYNC_MINUTES = 5;
 
 interface PluginSettings {
+	syncScope: SyncScope;
+	directoryShortcuts: Record<string, PersonalDirectoryShortcuts>;
 	language: Language;
 	cloudDirectoryName: string;
 	deviceName: string;
@@ -83,6 +94,7 @@ interface DashboardPreview {
 	confirm: boolean;
 	directory: string;
 	credentialRevision: number;
+	syncScope: SyncScope;
 }
 
 type AccountView = { state: 'signed-out' | 'expired' } | { state: 'connected'; label: string };
@@ -108,6 +120,8 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 	private dashboardQuota: { usedBytes: number; freeBytes: number } | undefined;
 	private dashboardQuotaLoading = false;
 	private dashboardRequest = 0;
+	private transferProgress: SyncProgress | undefined;
+	private transferRedrawAt = 0;
 
 	async onload(): Promise<void> {
 		const data = (await this.loadData()) as PersistedData | null;
@@ -120,6 +134,12 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		this.registerView(DASHBOARD_VIEW_TYPE, (leaf) => this.createDashboardView(leaf));
 		this.registerView(QUARK_BROWSER_VIEW_TYPE, (leaf) => new QuarkBrowserView(leaf, this.browserActions()));
 		this.registerView(QUARK_PREVIEW_VIEW_TYPE, (leaf) => new QuarkPreviewView(leaf, () => this.config.language));
+		this.registerView(QUARK_REFERENCE_MANAGER_VIEW_TYPE, (leaf) => new QuarkReferenceManagerView(leaf, {
+			language: () => this.config.language,
+			sourceIndex: () => this.config.sourceIndex,
+			check: (target) => this.checkQuarkReference(target),
+			chooseReplacement: (_row, signal) => this.chooseReferenceReplacement(signal),
+		}));
 		this.registerEditorExtension(createReferenceLivePreview({
 			language: () => this.config.language,
 			loadMedia: (reference, visible) => this.loadVisiblePersonalMedia(reference, visible),
@@ -142,6 +162,32 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 			name: this.config.language === 'en' ? 'Insert Quark Drive file' : '插入夸克网盘文件',
 			callback: () => void this.openBrowser(this.captureActiveEditorTarget()),
 		});
+		this.addCommand({
+			id: 'configure-sync-scope',
+			name: this.config.language === 'en' ? 'Configure device sync scope' : '配置此设备的同步范围',
+			callback: () => this.openSyncScope(),
+		});
+		this.addCommand({
+			id: 'quark-version-history',
+			name: this.config.language === 'en' ? 'Quark version history' : '夸克同步版本历史',
+			callback: () => this.openVersionHistory(this.app.workspace.getActiveFile()?.path),
+		});
+		this.addCommand({
+			id: 'quark-deleted-files',
+			name: this.config.language === 'en' ? 'Recover deleted Quark files' : '恢复已删除的同步文件',
+			callback: () => this.openVersionHistory(),
+		});
+		this.addCommand({
+			id: 'manage-quark-references',
+			name: this.config.language === 'en' ? 'Manage Quark references' : '管理网盘引用',
+			callback: () => void this.openReferenceManager(),
+		});
+		this.registerEvent(this.app.workspace.on('file-menu', (menu, file) => {
+			if (!this.app.vault.getFileByPath(file.path)) return;
+			menu.addItem((item) => item
+				.setTitle(this.config.language === 'en' ? 'View Quark version history' : '查看夸克同步历史')
+				.setIcon('history').onClick(() => this.openVersionHistory(file.path)));
+		}));
 		this.registerEvent(this.app.workspace.on('editor-menu', (menu, editor, info) => {
 			this.addEditorMenuItems(menu, editor, info);
 		}));
@@ -272,9 +318,7 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 	onunload(): void {
 		this.unloading = true;
 		this.loginModal?.close();
-		for (const leaf of this.app.workspace.getLeavesOfType(QUARK_BROWSER_VIEW_TYPE)) {
-			if (leaf.view instanceof QuarkBrowserView) leaf.view.clearSensitiveState();
-		}
+		this.clearQuarkBrowserSessions();
 		for (const leaf of this.app.workspace.getLeavesOfType(QUARK_PREVIEW_VIEW_TYPE)) {
 			if (leaf.view instanceof QuarkPreviewView) leaf.view.clear();
 		}
@@ -284,6 +328,12 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		if (this.autoSyncTimer !== undefined) {
 			window.clearInterval(this.autoSyncTimer);
 			this.autoSyncTimer = undefined;
+		}
+	}
+
+	private clearQuarkBrowserSessions(): void {
+		for (const leaf of this.app.workspace.getLeavesOfType(QUARK_BROWSER_VIEW_TYPE)) {
+			if (leaf.view instanceof QuarkBrowserView) leaf.view.clearSensitiveState();
 		}
 	}
 
@@ -349,6 +399,10 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 			.setTitle(this.config.language === 'en' ? 'Insert Quark Drive file' : '插入夸克网盘文件')
 			.setIcon('cloud')
 			.onClick(() => void this.openBrowser(target)));
+		const path = info.file?.path;
+		if (path) menu.addItem((item) => item
+			.setTitle(this.config.language === 'en' ? 'View Quark version history' : '查看夸克同步历史')
+			.setIcon('history').onClick(() => this.openVersionHistory(path)));
 		const selection = editor.getSelection();
 		const currentLine = editor.getLine(editor.getCursor().line);
 		const shareUrl = findOfficialShareUrl(selection) ?? findOfficialShareUrl(currentLine);
@@ -394,6 +448,25 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		return {
 			language: this.config.language,
 			listPersonal: async (parentFid) => await this.createClient(this.requireCookie()).listDirectory(parentFid),
+			listPersonalSearchPage: async (parentFid, page) => await this.createClient(this.requireCookie()).listDirectorySearchPage(parentFid, page),
+			getPersonalDirectoryShortcuts: () => normalizePersonalDirectoryShortcuts(
+				this.config.boundAccountId ? this.config.directoryShortcuts[this.config.boundAccountId] : undefined),
+			updatePersonalDirectoryShortcuts: async (update) => {
+				const account = this.config.boundAccountId;
+				if (!account || this.accountView.state !== 'connected' || this.unloading) return;
+				const previous = this.config.directoryShortcuts[account];
+				const next = normalizePersonalDirectoryShortcuts(update(normalizePersonalDirectoryShortcuts(previous)));
+				this.config.directoryShortcuts[account] = next;
+				try {
+					await this.persistData();
+				} catch (error) {
+					if (this.config.directoryShortcuts[account] === next) {
+						if (previous) this.config.directoryShortcuts[account] = previous;
+						else delete this.config.directoryShortcuts[account];
+					}
+					throw error;
+				}
+			},
 			openShare: async (pwdId, passcode) => await this.createShareClient().openShare(pwdId, passcode),
 			listShare: async (session, parentFid) => await this.createShareClient().listDirectory(session, parentFid),
 			previewPersonal: async (file, parentFid, target) => await this.previewPersonalFile(file, parentFid, target),
@@ -837,6 +910,7 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 				? { plan: this.dashboardPreview.plan, confirm: this.dashboardPreview.confirm }
 				: undefined,
 			skippedDetails: lastSummary?.skipped,
+			progress: this.transferProgress,
 			cloudQuota: account.state === 'connected' ? this.dashboardQuota : undefined,
 			quotaLoading: this.dashboardQuotaLoading,
 			vault: {
@@ -882,6 +956,10 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 				this.redrawDashboard();
 			},
 			settings: () => this.openPluginSettings(),
+			syncScope: () => this.openSyncScope(),
+			versionHistory: () => this.openVersionHistory(),
+			manageReferences: () => this.openReferenceManager(),
+			retryPath: (path) => this.retrySyncFile(path),
 			login: state !== 'connected' ? () => this.openQrLogin() : undefined,
 			exportPairing: !mobile && state === 'connected' ? () => new ExportPairingModal(this.app, this).open() : undefined,
 			importPairing: mobile && state !== 'connected' ? () => new ImportPairingModal(this.app, this).open() : undefined,
@@ -996,6 +1074,7 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		await this.runExclusive('退出登录', async () => {
 			this.app.secretStorage.setSecret(this.credentialId, '');
 			this.credentialRevision += 1;
+			this.clearQuarkBrowserSessions();
 			this.accountNickname = undefined;
 			this.dashboardQuota = undefined;
 			this.config.sessionExpired = false;
@@ -1193,6 +1272,197 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		new Notice(`自动同步间隔已设为 ${this.config.autoSyncIntervalMinutes} 分钟`);
 	}
 
+	private async openReferenceManager(): Promise<void> {
+		await this.runExclusive('打开网盘引用', async () => {
+			const existing = this.app.workspace.getLeavesOfType(QUARK_REFERENCE_MANAGER_VIEW_TYPE)[0];
+			const leaf = existing ?? this.app.workspace.getLeaf('tab');
+			if (!existing) await leaf.setViewState({ type: QUARK_REFERENCE_MANAGER_VIEW_TYPE, active: true });
+			await this.app.workspace.revealLeaf(leaf);
+		});
+	}
+
+	private async checkQuarkReference(target: QuarkReferenceTarget): Promise<ReferenceStatus> {
+		if (target.kind === 'personal') {
+			const cookie = this.readCookie();
+			const account = this.config.boundAccountId;
+			if (!cookie || !account || this.config.sessionExpired || this.unloading ||
+				await accountReferenceKey(account) !== target.reference.accountKey) return 'unknown';
+			try {
+				const file = await this.createClient(cookie).getFileById(target.reference.fid);
+				return file.isDirectory ? 'broken' : 'available';
+			} catch {
+				return 'unknown';
+			}
+		}
+		if (this.unloading) return 'unknown';
+		try {
+			const share = target.reference;
+			const client = this.createShareClient();
+			const session = await client.openShare(share.pwdId, share.passcode);
+			if (!share.selectedFid) return 'available';
+			const files = await client.listDirectory(session, share.selectedParentFid ?? '0');
+			return files.some((file) => file.fid === share.selectedFid && !file.isDirectory) ? 'available' : 'broken';
+		} catch (error) {
+			return error instanceof ShareApiError && (error.reason === 'missing' || error.reason === 'expired') ? 'broken' : 'unknown';
+		}
+	}
+
+	private async chooseReferenceReplacement(signal?: AbortSignal): Promise<string | undefined> {
+		const account = this.config.boundAccountId;
+		if (!account || this.accountView.state !== 'connected') {
+			new Notice(this.config.language === 'en' ? 'Sign in to Quark to choose a replacement.' : '登录夸克后才能选择替代文件。');
+			return undefined;
+		}
+		const revision = this.credentialRevision;
+		const key = await accountReferenceKey(account);
+		if (signal?.aborted || this.unloading) return undefined;
+		const picker = await this.openBrowser();
+		if (!picker || signal?.aborted || this.unloading) return undefined;
+		return await new Promise((resolve) => {
+			const finish = (value?: string) => {
+				signal?.removeEventListener('abort', cancel);
+				resolve(value);
+			};
+			const cancel = () => {
+				finish();
+				picker.setSelectionHandler();
+			};
+			picker.setSelectionHandler(async (file) => {
+				if (this.unloading || this.credentialRevision !== revision || this.config.boundAccountId !== account) {
+					throw new Error('夸克账号已变化，请重新打开引用选择器');
+				}
+				finish(formatPersonalReference(file.name, key, file.fid));
+			}, () => finish());
+			signal?.addEventListener('abort', cancel, { once: true });
+		});
+	}
+
+	private openVersionHistory(path?: string): void {
+		const directory = this.config.cloudDirectoryName;
+		const revision = this.credentialRevision;
+		const local = new LocalVaultAdapter(this.app);
+		const getService = () => {
+			if (this.config.cloudDirectoryName !== directory || revision !== this.credentialRevision) {
+				throw new Error('夸克会话或同步目录已更改，请重新打开版本历史');
+			}
+			return this.createService(this.requireCookie());
+		};
+		const readHistory = async () => {
+			const events = await this.runExclusive('读取版本历史', async () => getService().versionHistory(), true);
+			if (!events) throw new Error('暂时无法读取版本历史');
+			return events;
+		};
+		const currentContent = async (filePath: string) => {
+			const view = this.historyEditor(filePath);
+			if (!view) return await local.read(filePath);
+			const bytes = new TextEncoder().encode(view.editor.getValue());
+			return { bytes, sha256: await sha256Hex(bytes) };
+		};
+		const requireFileVersion = (event: VersionEvent) => {
+			validatePathSet([event.path], this.app.vault.configDir);
+			const managed = [...managedDownloadPaths(this.config.sourceIndex)];
+			if (managed.some((file) => file.normalize('NFKC').toLowerCase() === event.path.normalize('NFKC').toLowerCase())) {
+				throw new Error('该路径由网盘离线副本管理，无法在此恢复');
+			}
+		};
+		new VersionHistoryModal(this.app, {
+			language: this.config.language,
+			listVersions: async (filePath) => listFileVersions(await readHistory(), filePath),
+			listDeletedPaths: async () => listRecoverableDeletedPaths(await readHistory()),
+			previewVersion: async (event) => {
+				const data = await this.runExclusive('预览历史版本', async () => {
+					const service = getService();
+					requireFileVersion(event);
+					const bytes = event.size !== undefined && canPreviewVersionText(event.path, event.size)
+						? await service.readHistoricalVersion(event) : null;
+					return { bytes, current: await currentContent(event.path) };
+				}, true);
+				if (!data) throw new Error('暂时无法预览历史版本');
+				return data;
+			},
+			restoreVersion: async (event, mode, expectedHash) => {
+				const restored = await this.runExclusive('恢复历史版本', async () => {
+					const service = getService();
+					requireFileVersion(event);
+					const bytes = await service.readHistoricalVersion(event);
+					return await restoreVersionLocally(event, bytes, mode, expectedHash, {
+						isPathOccupied: async (filePath) => Boolean(this.app.vault.getAbstractFileByPath(filePath)) ||
+							await this.app.vault.adapter.exists(filePath) ||
+							Object.prototype.hasOwnProperty.call(this.config.snapshots, filePath) ||
+							Object.prototype.hasOwnProperty.call(this.config.pendingApplies, filePath) ||
+							managedDownloadPaths(this.config.sourceIndex).has(filePath),
+						write: async (filePath, content, originalHash) => {
+							const view = mode === 'current' ? this.historyEditor(filePath) : undefined;
+							if (!view) {
+								await local.write(filePath, content, this.app.vault.configDir, false, originalHash);
+								return;
+							}
+							const editor = view.editor;
+							const current = editor.getValue();
+							const comparableHash = await sha256Hex(new TextEncoder().encode(current));
+							if (originalHash !== comparableHash || this.historyEditor(filePath) !== view ||
+								view.editor !== editor || editor.getValue() !== current) {
+								throw new Error('当前笔记已更改，请刷新预览后重试');
+							}
+							const end = editor.offsetToPos(current.length);
+							editor.replaceRange(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(content), { line: 0, ch: 0 }, end);
+							await view.save();
+						},
+					});
+				}, true);
+				if (!restored) throw new Error('暂时无法恢复历史版本');
+				return restored;
+			},
+		}, path).open();
+	}
+
+	private historyEditor(path: string): MarkdownView | undefined {
+		const views = this.app.workspace.getLeavesOfType('markdown')
+			.map((leaf) => leaf.view)
+			.filter((view): view is MarkdownView => view instanceof MarkdownView && view.file?.path === path && view.getMode() === 'source');
+		const view = views[0];
+		if (view && views.some((other) => other.editor.getValue() !== view.editor.getValue())) {
+			throw new Error('同一笔记存在不同的编辑内容，请先保存后再恢复');
+		}
+		return view;
+	}
+
+	private openSyncScope(): void {
+		const original = this.config.syncScope;
+		const startDirectory = this.config.cloudDirectoryName;
+		const startCredential = this.credentialRevision;
+		new SyncScopeModal(this.app, this.config.language === 'en', original, (scope) =>
+			this.runExclusive('预览同步范围', async () => this.createService(this.requireCookie()).previewScope(scope), true),
+		async (scope) => (await this.runExclusive('保存同步范围', async () => {
+			if (!this.isCurrentSyncPreview(startDirectory, startCredential, original)) return false;
+			this.config.syncScope = scope;
+			this.dashboardPreview = undefined;
+			try {
+				await this.persistData();
+			} catch (error) {
+				this.config.syncScope = original;
+				throw error;
+			}
+			return true;
+		})) === true).open();
+	}
+
+	private async retrySyncFile(path: string): Promise<void> {
+		if (!this.config.initialSyncCompleted || !this.config.lastSummary?.skipped.some((item) => item.retryable && item.path === path)) return;
+		await this.performSync(false, false, true, path);
+	}
+
+	private reportTransferProgress(progress: SyncProgress): void {
+		if (this.unloading) return;
+		const previous = this.transferProgress;
+		this.transferProgress = progress;
+		const now = Date.now();
+		if (previous?.path === progress.path && previous.phase === progress.phase && now - this.transferRedrawAt < 250 &&
+			progress.bytes !== progress.total) return;
+		this.transferRedrawAt = now;
+		this.redrawDashboard();
+	}
+
 	private readSyncPreview(firstSync: boolean): Promise<SyncPlan | undefined> {
 		return this.runExclusive(firstSync ? '读取首次同步预览' : '读取同步预览', async () => {
 			return await this.createService(this.requireCookie()).preview();
@@ -1204,10 +1474,11 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		if (!dashboard || this.busy || this.unloading) return;
 		const directory = this.config.cloudDirectoryName;
 		const credentialRevision = this.credentialRevision;
+		const syncScope = this.config.syncScope;
 		this.dashboardPreview = undefined;
 		const plan = await this.readSyncPreview(confirm);
 		if (!plan || this.dashboard !== dashboard || this.unloading) return;
-		this.dashboardPreview = { plan, confirm, directory, credentialRevision };
+		this.dashboardPreview = { plan, confirm, directory, credentialRevision, syncScope };
 		this.redrawDashboard();
 	}
 
@@ -1226,7 +1497,7 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		const preview = this.dashboardPreview;
 		if (!preview?.confirm || this.busy || this.unloading) return;
 		this.dashboardPreview = undefined;
-		if (!this.isCurrentSyncPreview(preview.directory, preview.credentialRevision)) {
+		if (!this.isCurrentSyncPreview(preview.directory, preview.credentialRevision, preview.syncScope)) {
 			this.redrawDashboard();
 			return;
 		}
@@ -1234,11 +1505,11 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		if (summary) void this.refreshDashboard(false);
 	}
 
-	private isCurrentSyncPreview(directory: string, credentialRevision: number): boolean {
-		if (directory === this.config.cloudDirectoryName && credentialRevision === this.credentialRevision) return true;
+	private isCurrentSyncPreview(directory: string, credentialRevision: number, syncScope: SyncScope): boolean {
+		if (directory === this.config.cloudDirectoryName && credentialRevision === this.credentialRevision && syncScope === this.config.syncScope) return true;
 		new Notice(this.config.language === 'en'
-			? 'The cloud folder or session changed. Preview again before syncing.'
-			: '云端目录或登录状态已更改，请重新预览后再同步。');
+			? 'The cloud folder, session, or sync scope changed. Preview again before syncing.'
+			: '云端目录、登录状态或同步范围已更改，请重新预览后再同步。');
 		return false;
 	}
 
@@ -1254,14 +1525,15 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		}
 		const directory = this.config.cloudDirectoryName;
 		const credentialRevision = this.credentialRevision;
+		const syncScope = this.config.syncScope;
 		const plan = await this.readSyncPreview(true);
 		if (!plan || this.unloading) return;
 		new PlanModal(this.app, plan, true, () => {
-			if (this.isCurrentSyncPreview(directory, credentialRevision)) void this.performSync(true);
+			if (this.isCurrentSyncPreview(directory, credentialRevision, syncScope)) void this.performSync(true);
 		}).open();
 	}
 
-	private async performSync(confirmedInitialSync: boolean, automatic = false, showSummary = true): Promise<SyncSummary | undefined> {
+	private async performSync(confirmedInitialSync: boolean, automatic = false, showSummary = true, retryPath?: string): Promise<SyncSummary | undefined> {
 		if (this.unloading || (automatic && !this.canRunAutomaticSync())) return;
 		if (!this.config.initialSyncCompleted && !confirmedInitialSync) {
 			await this.requestSync();
@@ -1270,7 +1542,18 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		const summary = await this.runExclusive('同步', async () => {
 			const cookie = this.requireCookie();
 			const client = this.createClient(cookie);
-			const result = sanitizeSummary(await this.createService(cookie, client).sync(), cookie);
+			const service = this.createService(cookie, client);
+			let result: SyncSummary;
+			try {
+				result = sanitizeSummary(await service.sync(retryPath, (progress) => this.reportTransferProgress({
+					...progress, path: progress.path.split(cookie).join('[Cookie 已隐藏]'),
+				})), cookie);
+			} finally {
+				this.transferProgress = undefined;
+			}
+			if (retryPath !== undefined) {
+				result.skipped.unshift(...(this.config.lastSummary?.skipped.filter((item) => item.path !== retryPath) ?? []));
+			}
 			if (!this.unloading) {
 				const currentAccountId = this.config.boundAccountId ?? await client.checkConnection();
 				const root = await client.findRootFolder(this.config.cloudDirectoryName);
@@ -1291,12 +1574,12 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 			}
 			return result;
 		}, true);
-		if (summary && !this.unloading && !automatic && showSummary) new SyncSummaryModal(this.app, summary).open();
+		if (summary && !this.unloading && !automatic && showSummary) new SyncSummaryModal(this.app, summary, (path) => this.retrySyncFile(path)).open();
 		return summary;
 	}
 
 	showLastSummary(): void {
-		if (this.config.lastSummary) new SyncSummaryModal(this.app, this.config.lastSummary).open();
+		if (this.config.lastSummary) new SyncSummaryModal(this.app, this.config.lastSummary, (path) => this.retrySyncFile(path)).open();
 		else new Notice('还没有同步记录');
 	}
 
@@ -1361,6 +1644,7 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 			throw new Error('二维码登录已取消，未保存会话');
 		}
 		if (this.unloading) return;
+		this.clearQuarkBrowserSessions();
 		this.storeSession(inspected.cookie, inspected.nickname);
 	}
 
@@ -1474,6 +1758,7 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 			if (!this.unloading) {
 				if (usesSavedSession && error instanceof QuarkAuthenticationError) {
 					this.config.sessionExpired = true;
+					this.clearQuarkBrowserSessions();
 					this.refreshAutoSyncTimer();
 					try {
 						await this.persistData();
@@ -1535,6 +1820,8 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		if (this.unloading) return;
 		await this.saveData({
 			language: this.config.language,
+			syncScope: this.config.syncScope,
+			directoryShortcuts: this.config.directoryShortcuts,
 			cloudDirectoryName: this.config.cloudDirectoryName,
 			deviceName: this.config.deviceName,
 			autoSync: this.config.autoSync,
@@ -2119,7 +2406,7 @@ class PlanModal extends Modal {
 class SyncSummaryModal extends Modal {
 	private readonly summary: SyncSummary;
 
-	constructor(app: App, summary: SyncSummary) {
+	constructor(app: App, summary: SyncSummary, private readonly retry: (path: string) => Promise<void>) {
 		super(app);
 		this.summary = summary;
 	}
@@ -2131,7 +2418,19 @@ class SyncSummaryModal extends Modal {
 		contentEl.createEl('p', {
 			text: `已上传 ${this.summary.uploaded}，已下载 ${this.summary.downloaded}，已删除 ${this.summary.deleted}，冲突副本 ${this.summary.conflicts}，跳过 ${this.summary.skipped.length}。`,
 		});
-		appendList(contentEl, '跳过路径及原因', this.summary.skipped.map((item) => `${item.path} — ${item.reason}`));
+		if (this.summary.skipped.length) {
+			new Setting(contentEl).setName('跳过路径及原因').setHeading();
+			const list = contentEl.createEl('ul', { cls: 'quark-history-list' });
+			for (const item of this.summary.skipped) {
+				const row = list.createEl('li', { text: `${item.path} — ${item.reason} ` });
+				if (!item.retryable) continue;
+				const button = row.createEl('button', { text: '重试此文件' });
+				button.addEventListener('click', () => {
+					this.close();
+					void this.retry(item.path);
+				});
+			}
+		}
 		const close = contentEl.createDiv({ cls: 'modal-button-container' }).createEl('button', { text: '关闭' });
 		close.addEventListener('click', () => this.close());
 	}
@@ -2221,6 +2520,8 @@ function normalizeSettings(data: PersistedData): PluginSettings {
 		: DEFAULT_AUTO_SYNC_MINUTES;
 	return {
 		language: data.language === 'en' ? 'en' : 'zh-CN',
+		syncScope: normalizeSyncScope(data.syncScope),
+		directoryShortcuts: normalizeDirectoryShortcutAccounts(data.directoryShortcuts),
 		cloudDirectoryName: directory,
 		deviceName,
 		autoSync: data.autoSync === true && data.initialSyncCompleted === true,
@@ -2242,6 +2543,15 @@ function normalizeSettings(data: PersistedData): PluginSettings {
 	};
 }
 
+function normalizeDirectoryShortcutAccounts(input: unknown): Record<string, PersonalDirectoryShortcuts> {
+	const results = emptyMap<PersonalDirectoryShortcuts>();
+	if (!input || typeof input !== 'object' || Array.isArray(input)) return results;
+	for (const [account, shortcuts] of Object.entries(input).slice(0, 20)) {
+		if (isSafeIdentity(account)) results[account] = normalizePersonalDirectoryShortcuts(shortcuts);
+	}
+	return results;
+}
+
 function normalizeSummary(input: unknown): SyncSummary | null {
 	if (!input || typeof input !== 'object' || Array.isArray(input)) return null;
 	const value = input as Partial<SyncSummary>;
@@ -2249,7 +2559,7 @@ function normalizeSummary(input: unknown): SyncSummary | null {
 	if (!counts.every((count) => typeof count === 'number' && Number.isSafeInteger(count) && count >= 0) || !Array.isArray(value.skipped)) return null;
 	const skipped = value.skipped.flatMap((item) => {
 		if (!item || typeof item !== 'object' || typeof item.path !== 'string' || typeof item.reason !== 'string') return [];
-		return [{ path: item.path, reason: item.reason }];
+		return [{ path: item.path, reason: item.reason, ...(item.retryable === true ? { retryable: true } : {}) }];
 	}).slice(0, 500);
 	return {
 		uploaded: value.uploaded!,
@@ -2267,7 +2577,7 @@ function sanitizeSummary(summary: SyncSummary, cookie: string): SyncSummary {
 		downloaded: summary.downloaded,
 		deleted: summary.deleted,
 		conflicts: summary.conflicts,
-		skipped: summary.skipped.map((item) => ({ path: redact(item.path), reason: redact(item.reason) })),
+		skipped: summary.skipped.map((item) => ({ path: redact(item.path), reason: redact(item.reason), ...(item.retryable && redact(item.path) === item.path ? { retryable: true } : {}) })),
 	};
 }
 

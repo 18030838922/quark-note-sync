@@ -14,6 +14,7 @@ export interface HttpRequest {
 	responseKind?: ResponseKind;
 	purpose?: RequestPurpose;
 	maxResponseBytes?: number;
+	onDownloadProgress?: (receivedBytes: number) => void;
 	signal?: AbortSignal;
 }
 
@@ -173,6 +174,7 @@ export class QuarkTransport {
 		const responseKind = useRequestedKind ? request.responseKind ?? 'text' : 'text';
 		const bytes = normalizeNativeBody(response.data, responseKind, contentType);
 		assertResponseLengthWithinLimit(bytes, maxResponseBytes);
+		if (status === 200) request.onDownloadProgress?.(bytes.byteLength);
 		return makeResponse(status, responseHeaders, responseUrl, bytes);
 	}
 
@@ -224,6 +226,7 @@ export class QuarkTransport {
 						return;
 					}
 					receivedBytes += bytes.byteLength;
+					if (incoming.statusCode === 200) request.onDownloadProgress?.(receivedBytes);
 					chunks.push(bytes);
 				});
 				incoming.on('end', () => {

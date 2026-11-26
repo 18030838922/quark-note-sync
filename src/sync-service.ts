@@ -8,6 +8,7 @@ import { buildSyncPlan, type SyncPlan, type SyncSnapshot } from './sync-engine.t
 import { recoverPendingApply } from './core.ts';
 import { applyIfCurrentHash } from './safe-apply.ts';
 import { managedDownloadPaths, type SourceIndex } from './source-index.ts';
+import { selectSyncScope, type ScopeSelection, type SyncScope } from './sync-scope.ts';
 
 const CLOUD_DATA_DIRECTORY = 'Obsidian Sync Data';
 const CLOUD_BLOB_DIRECTORY = 'blobs';
@@ -18,6 +19,7 @@ const MAX_MANIFEST_BYTES = 10 * 1024 * 1024;
 
 export interface SyncSettingsView {
 	cloudDirectoryName: string;
+	syncScope?: SyncScope;
 }
 
 export interface PendingApplyState {
@@ -39,7 +41,14 @@ export interface SyncSummary {
 	downloaded: number;
 	deleted: number;
 	conflicts: number;
-	skipped: Array<{ path: string; reason: string }>;
+	skipped: Array<{ path: string; reason: string; retryable?: boolean }>;
+}
+
+export interface SyncProgress {
+	path: string;
+	phase: 'upload' | 'download' | 'apply';
+	bytes?: number;
+	total?: number;
 }
 
 interface CloudLayout {
@@ -73,65 +82,126 @@ export class QuarkSyncService {
 
 	async preview(): Promise<SyncPlan> {
 		await this.client.checkConnection();
-		const remote = await this.readRemoteContext(false);
-		const scan = await this.local.scan(this.app.vault.configDir, this.managedPaths());
-		return await this.makePlan(remote.events, scan);
+		const { events } = await this.readRemoteContext();
+		return await this.makePlan(events, this.excludedPaths(events));
 	}
 
-	async sync(): Promise<SyncSummary> {
-		await this.recoverPendingApplies();
+	async previewScope(scope: SyncScope): Promise<ScopeSelection> {
+		await this.client.checkConnection();
+		const { events } = await this.readRemoteContext();
+		return this.selectScope(scope, events);
+	}
+
+	async versionHistory(): Promise<VersionEvent[]> {
+		await this.client.checkConnection();
+		return (await this.readRemoteContext()).events;
+	}
+
+	async readHistoricalVersion(event: VersionEvent): Promise<Uint8Array> {
+		await this.client.checkConnection();
+		const { layout } = await this.readRemoteContext(undefined, false);
+		const folder = layout?.dataFid ? await this.client.findChildByName(layout.dataFid, CLOUD_BLOB_DIRECTORY) : undefined;
+		if (!layout || !folder?.isDirectory) throw new Error('夸克同步内容目录不存在');
+		return await this.downloadBlob({ ...layout, blobsFid: folder.fid }, event);
+	}
+
+	async sync(selectedPath?: string, progress?: (state: SyncProgress) => void): Promise<SyncSummary> {
 		await this.client.checkConnection();
 		const layout = await this.ensureCloudLayout();
-		const remote = await this.readRemoteContext(false, layout);
-		const scan = await this.local.scan(this.app.vault.configDir, this.managedPaths());
-		const plan = await this.makePlan(remote.events, scan);
-		const skipped = [...plan.skipped];
+		const { events } = await this.readRemoteContext(layout);
+		const excluded = this.excludedPaths(events);
+		await this.recoverPendingApplies(excluded, selectedPath);
+		const plan = await this.makePlan(events, excluded);
+		const selected = (path: string) => selectedPath === undefined || path === selectedPath;
+		const skipped: SyncSummary['skipped'] = plan.skipped.filter((item) => selected(item.path));
+		if (selectedPath && excluded.has(selectedPath)) skipped.push({ path: selectedPath, reason: '此设备的同步范围已排除此文件' });
 		let uploaded = 0;
 		let downloaded = 0;
 		let deleted = 0;
 		let conflicts = 0;
 
-		const batches = splitEvents(plan.events, TARGET_MANIFEST_BATCH_BYTES);
+		const failedUploads = new Set<string>();
+		const batches = splitEvents(plan.events.filter((event) => selected(event.path)), TARGET_MANIFEST_BATCH_BYTES);
 		for (const batch of batches) {
+			const ready: VersionEvent[] = [];
 			for (const event of batch) {
-				if (event.kind !== 'file') continue;
-				const content = await this.local.read(event.path);
-				if (!content || content.bytes.byteLength !== event.size || content.sha256 !== event.sha256) {
-					throw new Error(`本地文件在上传前发生变化，未发布相关清单：${event.path}`);
+				if (event.kind === 'file') {
+					try {
+						progress?.({ path: event.path, phase: 'upload', bytes: 0, total: event.size });
+						const content = await this.local.read(event.path);
+						if (!content || content.bytes.byteLength !== event.size || content.sha256 !== event.sha256) {
+							throw new Error('本地文件在上传前发生变化');
+						}
+						await this.ensureBlob(layout.blobsFid!, event.sha256, event.size, content.bytes, (bytes) => {
+							progress?.({ path: event.path, phase: 'upload', bytes, total: event.size });
+						});
+					} catch (error) {
+						if (error instanceof QuarkAuthenticationError) throw error;
+						failedUploads.add(event.path);
+						skipped.push({ path: event.path, reason: safeError(error), retryable: true });
+						continue;
+					}
 				}
-				await this.ensureBlob(layout.blobsFid!, event.sha256, event.size, content.bytes);
+				ready.push(event);
 			}
-			await this.publishBatch(layout, batch);
-			this.acknowledgeLocalEvents(batch);
+			if (!ready.length) continue;
+			await this.publishBatch(layout, ready);
+			this.acknowledgeLocalEvents(ready);
 			await this.state.persist();
-			uploaded += batch.filter((event) => event.kind === 'file').length;
+			uploaded += ready.filter((event) => event.kind === 'file').length;
 		}
 
 		for (const pathPlan of plan.paths) {
+			if (!selected(pathPlan.path) || failedUploads.has(pathPlan.path)) continue;
 			try {
-				const result = await this.applyPath(layout, pathPlan);
+				progress?.({ path: pathPlan.path, phase: 'apply' });
+				const result = await this.applyPath(layout, pathPlan, progress);
 				if (result === 'downloaded') downloaded += 1;
 				if (result === 'deleted') deleted += 1;
 				if (result !== 'skipped') conflicts += pathPlan.result.conflictCopies.length;
 				if (result === 'skipped') {
-					skipped.push({ path: pathPlan.path, reason: '本地文件在同步期间发生变化，已保留并跳过覆盖' });
+					skipped.push({ path: pathPlan.path, reason: '本地文件在同步期间发生变化，已保留并跳过覆盖', retryable: true });
 				}
 			} catch (error) {
 				if (error instanceof QuarkAuthenticationError) throw error;
-				skipped.push({ path: pathPlan.path, reason: safeError(error) });
+				skipped.push({ path: pathPlan.path, reason: safeError(error), retryable: true });
 			}
 		}
 		return { uploaded, downloaded, deleted, conflicts, skipped: dedupeSkipped(skipped) };
 	}
 
-	private async makePlan(remoteEvents: VersionEvent[], scan: LocalScan): Promise<SyncPlan> {
+	private selectScope(scope: SyncScope, events: VersionEvent[]): ScopeSelection {
+		const configDir = this.app.vault.configDir;
+		const managed = new Set([...this.managedPaths()].map(pathKey));
+		const check = (path: string) => {
+			if (managed.has(pathKey(path))) return false;
+			try {
+				validatePathSet([path], configDir);
+				return true;
+			} catch { return false; }
+		};
+		const local = this.app.vault.getFiles().filter((file) => check(file.path)).map((file) => ({ path: file.path, size: file.stat.size }));
+		const savedPaths = [...Object.keys(this.state.snapshots), ...Object.keys(this.state.pendingApplies)].filter(check);
+		return selectSyncScope(scope, local, events.filter((event) => check(event.path)), savedPaths);
+	}
+
+	private excludedPaths(events: VersionEvent[]): Set<string> {
+		const scope = this.settings.syncScope;
+		if (!scope || (!scope.folders.length && !scope.extensions.length && scope.maxBytes === null)) return new Set();
+		return new Set(this.selectScope(scope, events).excluded);
+	}
+
+	private async makePlan(remoteEvents: VersionEvent[], excluded: ReadonlySet<string>): Promise<SyncPlan> {
+		const managedPaths = this.managedPaths();
+		const excludedKeys = new Set([...excluded].map(pathKey));
+		const scan: LocalScan = await this.local.scan(this.app.vault.configDir, new Set([...managedPaths, ...excluded]));
 		return await buildSyncPlan({
 			localFiles: scan.files,
 			presentPaths: scan.presentPaths,
 			protectedPaths: scan.protectedPaths,
-			snapshots: this.state.snapshots,
-			remoteEvents,
-			managedPaths: [...this.managedPaths()],
+			snapshots: Object.fromEntries(Object.entries(this.state.snapshots).filter(([path]) => !excludedKeys.has(pathKey(path)))),
+			remoteEvents: remoteEvents.filter((event) => !excludedKeys.has(pathKey(event.path))),
+			managedPaths: [...managedPaths],
 			deviceId: this.state.deviceId,
 			now: Date.now(),
 			configDir: this.app.vault.configDir,
@@ -142,7 +212,7 @@ export class QuarkSyncService {
 		return managedDownloadPaths(this.state.sourceIndex ?? Object.create(null) as SourceIndex);
 	}
 
-	private async readRemoteContext(create: boolean, existingLayout?: CloudLayout): Promise<RemoteContext> {
+	private async readRemoteContext(existingLayout?: CloudLayout, loadEvents = true): Promise<RemoteContext> {
 		let layout = existingLayout;
 		if (!layout) {
 			const root = await this.client.findChildByName('0', this.settings.cloudDirectoryName);
@@ -151,7 +221,6 @@ export class QuarkSyncService {
 			const vaultId = await sha256Hex(new TextEncoder().encode(`quark-vault:${root.fid}`));
 			layout = { rootFid: root.fid, vaultId };
 		}
-		if (create) layout = await this.ensureCloudLayout();
 		if (!layout.eventsFid) {
 			const data = await this.client.findChildByName(layout.rootFid, CLOUD_DATA_DIRECTORY);
 			if (!data) return { layout, events: [] };
@@ -162,7 +231,7 @@ export class QuarkSyncService {
 			if (!events.isDirectory) throw new Error('夸克事件目录被文件占用');
 			layout.eventsFid = events.fid;
 		}
-		const events = await this.readAllEvents(layout);
+		const events = loadEvents ? await this.readAllEvents(layout) : [];
 		return { layout, events };
 	}
 
@@ -195,7 +264,7 @@ export class QuarkSyncService {
 		return events;
 	}
 
-	private async ensureBlob(blobsFid: string, sha256: string, size: number, bytes: Uint8Array): Promise<void> {
+	private async ensureBlob(blobsFid: string, sha256: string, size: number, bytes: Uint8Array, onProgress?: (bytes: number) => void): Promise<void> {
 		const name = `${sha256}.bin`;
 		const existing = await this.client.findChildByName(blobsFid, name);
 		if (existing) {
@@ -204,7 +273,7 @@ export class QuarkSyncService {
 			if (await sha256Hex(remoteBytes) !== sha256) throw new Error(`夸克内容对象摘要错误：${name}`);
 			return;
 		}
-		const uploaded = await this.client.uploadFile(blobsFid, name, bytes);
+		const uploaded = await this.client.uploadFile(blobsFid, name, bytes, onProgress);
 		const confirmed = await this.client.downloadFile(uploaded);
 		if (confirmed.byteLength !== size || await sha256Hex(confirmed) !== sha256) {
 			throw new Error(`夸克内容对象上传校验失败：${name}`);
@@ -243,6 +312,7 @@ export class QuarkSyncService {
 	private async applyPath(
 		layout: CloudLayout,
 		pathPlan: SyncPlan['paths'][number],
+		progress?: (state: SyncProgress) => void,
 	): Promise<'downloaded' | 'deleted' | 'unchanged' | 'skipped'> {
 		await this.validateApplyPaths(pathPlan);
 		this.state.pendingApplies[pathPlan.path] = {
@@ -260,7 +330,7 @@ export class QuarkSyncService {
 				continue;
 			}
 			const local = await this.local.read(pathPlan.path);
-			const bytes = local && local.sha256 === event.sha256 ? local.bytes : await this.downloadBlob(layout, event);
+			const bytes = local && local.sha256 === event.sha256 ? local.bytes : await this.downloadWithProgress(layout, event, progress);
 			if (bytes.byteLength !== event.size || await sha256Hex(bytes) !== event.sha256) {
 				throw new Error(`冲突版本校验失败：${copyPath}`);
 			}
@@ -305,7 +375,7 @@ export class QuarkSyncService {
 			await this.acknowledgeAndClearPending(pathPlan);
 			return 'unchanged';
 		}
-		const bytes = await this.downloadBlob(layout, winner);
+		const bytes = await this.downloadWithProgress(layout, winner, progress);
 		let written: boolean;
 		try {
 			written = await applyIfCurrentHash(
@@ -324,12 +394,18 @@ export class QuarkSyncService {
 		return written ? 'downloaded' : 'skipped';
 	}
 
-	private async downloadBlob(layout: CloudLayout, event: VersionEvent): Promise<Uint8Array> {
+	private async downloadWithProgress(layout: CloudLayout, event: VersionEvent, progress?: (state: SyncProgress) => void): Promise<Uint8Array> {
+		const report = (bytes: number) => progress?.({ path: event.path, phase: 'download', bytes, total: event.size });
+		report(0);
+		return await this.downloadBlob(layout, event, report);
+	}
+
+	private async downloadBlob(layout: CloudLayout, event: VersionEvent, onProgress?: (bytes: number) => void): Promise<Uint8Array> {
 		if (!event.sha256 || event.size === undefined || !layout.blobsFid) throw new Error('版本记录缺少内容摘要或大小');
 		const name = `${event.sha256}.bin`;
 		const blob = await this.client.findChildByName(layout.blobsFid, name);
 		if (!blob || blob.isDirectory || blob.size !== event.size) throw new Error(`夸克中缺少内容对象：${name}`);
-		const bytes = await this.client.downloadFile(blob);
+		const bytes = await this.client.downloadFile(blob, undefined, onProgress);
 		if (bytes.byteLength !== event.size || await sha256Hex(bytes) !== event.sha256) throw new Error(`夸克内容校验失败：${name}`);
 		return bytes;
 	}
@@ -359,9 +435,10 @@ export class QuarkSyncService {
 		await this.state.persist();
 	}
 
-	private async recoverPendingApplies(): Promise<void> {
+	private async recoverPendingApplies(excluded: ReadonlySet<string>, selectedPath?: string): Promise<void> {
 		let changed = false;
 		for (const [path, pending] of Object.entries(this.state.pendingApplies)) {
+			if (excluded.has(path) || (selectedPath !== undefined && path !== selectedPath)) continue;
 			if ([...this.managedPaths()].some((managedPath) => pathKey(managedPath) === pathKey(path))) {
 				delete this.state.pendingApplies[path];
 				changed = true;
@@ -419,7 +496,7 @@ function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
 	return true;
 }
 
-function dedupeSkipped(skipped: Array<{ path: string; reason: string }>): Array<{ path: string; reason: string }> {
+function dedupeSkipped(skipped: SyncSummary['skipped']): SyncSummary['skipped'] {
 	const keys = new Set<string>();
 	return skipped.filter((entry) => {
 		const key = `${entry.path}\u0000${entry.reason}`;

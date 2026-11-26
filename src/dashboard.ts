@@ -1,5 +1,6 @@
 import { ItemView, Notice, setIcon, type WorkspaceLeaf } from 'obsidian';
 import type { SyncPlan } from './sync-engine.ts';
+import type { SyncProgress, SyncSummary } from './sync-service.ts';
 
 export const DASHBOARD_VIEW_TYPE = 'quark-note-sync-dashboard';
 
@@ -28,7 +29,8 @@ export interface QuarkDashboardView {
 		freeBytes: number;
 	};
 	quotaLoading?: boolean;
-	skippedDetails?: readonly { path: string; reason: string }[];
+	skippedDetails?: Readonly<SyncSummary['skipped']>;
+	progress?: SyncProgress;
 	vault: {
 		totalBytes: number;
 		fileCount?: number;
@@ -70,11 +72,15 @@ export interface QuarkDashboardActions {
 	importPairing?: () => void | Promise<void>;
 	logout?: () => void | Promise<void>;
 	showLastSync?: () => void | Promise<void>;
+	syncScope?: () => void;
+	versionHistory?: () => void;
+	manageReferences?: () => void | Promise<void>;
+	retryPath?: (path: string) => void | Promise<void>;
 	openFile?: (path: string) => void | Promise<void>;
 	close?: () => void;
 }
 
-type DashboardActionName = Exclude<keyof QuarkDashboardActions, 'ready' | 'close' | 'openFile' | 'showLastSync' | 'setPeriodicSync' | 'setStartupSync'>;
+type DashboardActionName = Exclude<keyof QuarkDashboardActions, 'ready' | 'close' | 'openFile' | 'showLastSync' | 'setPeriodicSync' | 'setStartupSync' | 'retryPath'>;
 
 type DashboardCopy = {
 	title: string;
@@ -368,6 +374,8 @@ export class QuarkDashboardSidebar extends ItemView {
 		this.renderPrimaryActions(text);
 		if (this.settingsExpanded) this.renderInlineSettings(text);
 		this.renderSecondaryActions(text);
+		this.renderSyncTools();
+		this.renderTransferProgress();
 		if (this.view.inline) this.renderInlinePlan(text);
 		if (this.skippedExpanded) this.renderSkippedDetails(text);
 
@@ -376,6 +384,29 @@ export class QuarkDashboardSidebar extends ItemView {
 		this.renderBreakdown(panels, text);
 		this.renderSyncActivity(panels, text);
 		this.renderLargestFiles(text);
+	}
+
+	private renderSyncTools(): void {
+		const english = this.view.language === 'en';
+		const tools = this.root.createDiv({ cls: 'quark-dashboard-secondary-actions' });
+		this.actionButton(tools, english ? 'Sync scope' : '同步范围', 'quark-dashboard-button-secondary', 'syncScope', 'filter', true);
+		this.actionButton(tools, english ? 'Version history' : '版本历史', 'quark-dashboard-button-secondary', 'versionHistory', 'history', true);
+		this.actionButton(tools, english ? 'Quark references' : '网盘引用', 'quark-dashboard-button-secondary', 'manageReferences', 'link');
+	}
+
+	private renderTransferProgress(): void {
+		const progress = this.view.progress;
+		if (!progress) return;
+		const english = this.view.language === 'en';
+		const labels = english ? { upload: 'Uploading', download: 'Downloading', apply: 'Applying sync' } : { upload: '上传中', download: '下载中', apply: '应用同步' };
+		const card = this.root.createDiv({ cls: 'quark-dashboard-inline-settings quark-dashboard-transfer', attr: { role: 'status' } });
+		card.createEl('p', { text: `${labels[progress.phase]} · ${progress.path}` });
+		if (progress.bytes !== undefined && progress.total !== undefined && progress.total > 0) {
+			const bar = card.createEl('progress', { cls: 'quark-dashboard-progress', attr: { 'aria-label': labels[progress.phase] } });
+			bar.max = progress.total;
+			bar.value = Math.min(progress.bytes, progress.total);
+			card.createSpan({ text: `${formatBytes(progress.bytes, this.view.language)} / ${formatBytes(progress.total, this.view.language)}` });
+		}
 	}
 
 	private renderStatusStrip(text: DashboardCopy): void {
@@ -708,6 +739,12 @@ export class QuarkDashboardSidebar extends ItemView {
 			const row = list.createEl('li');
 			row.createEl('code', { text: item.path });
 			row.createSpan({ text: item.reason });
+			const retry = this.actions.retryPath;
+			if (item.retryable && retry) {
+				const button = row.createEl('button', { text: this.view.language === 'en' ? 'Retry file' : '重试此文件' });
+				button.disabled = this.view.busy;
+				button.addEventListener('click', () => this.runValueAction(() => retry(item.path)));
+			}
 		}
 	}
 

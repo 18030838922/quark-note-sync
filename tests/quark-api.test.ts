@@ -72,6 +72,23 @@ test('directory listing follows all declared pages before returning files', asyn
 	assert.equal(new URL(transport.requests[1].url).searchParams.get('_page'), '2');
 });
 
+test('the file search listing reads exactly the requested page even when more pages exist', async () => {
+	const transport = new FixtureTransport(() => response({
+		code: 0,
+		data: { list: [{ fid: 'matched', file_name: 'Notes.pdf', file_type: 1, pdir_fid: 'archive' }] },
+		metadata: { _total: 120 },
+	}));
+	const page = await new QuarkClient(transport, 'sid=secret').listDirectorySearchPage('archive', 2);
+
+	assert.equal(page.total, 120);
+	assert.equal(page.entries[0].parentFid, 'archive');
+	assert.equal(transport.requests.length, 1);
+	const url = new URL(transport.requests[0].url);
+	assert.equal(url.pathname, '/1/clouddrive/file/sort');
+	assert.equal(url.searchParams.get('pdir_fid'), 'archive');
+	assert.equal(url.searchParams.get('_page'), '2');
+});
+
 test('personal references resolve moved files through the authenticated file ID metadata endpoint', async () => {
 	const transport = new FixtureTransport((request) => {
 		const url = new URL(request.url);

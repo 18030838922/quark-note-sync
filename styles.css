@@ -936,3 +936,110 @@
 .quark-inline-media-video {
 	margin-block: 0.8em;
 }
+
+
+.quark-history-actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	margin-block: 10px;
+}
+
+.quark-history-actions > button[aria-pressed="true"] {
+	color: var(--text-accent);
+	box-shadow: inset 0 0 0 1px var(--interactive-accent);
+}
+
+.quark-history-path,
+.quark-history-detail,
+.quark-history-list button {
+	overflow-wrap: anywhere;
+}
+
+.quark-history-filter {
+	box-sizing: border-box;
+	margin-top: 6px;
+	width: 100%;
+}
+
+.quark-history-list {
+	list-style: none;
+	padding: 0;
+}
+
+.quark-history-list > li {
+	border-bottom: 1px solid var(--background-modifier-border);
+	padding-block: 8px;
+}
+
+.quark-history-list button {
+	height: auto;
+	max-width: 100%;
+	min-height: var(--input-height);
+	text-align: start;
+	white-space: normal;
+}
+
+.quark-history-detail {
+	color: var(--text-muted);
+	font-size: var(--font-ui-small);
+	margin-top: 4px;
+}
+
+.quark-history-text {
+	background: var(--background-secondary);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-m);
+	max-height: min(45vh, 420px);
+	overflow: auto;
+	overflow-wrap: anywhere;
+	padding: 12px;
+	white-space: pre-wrap;
+}
+
+.quark-history-line-add {
+	color: var(--text-success, var(--color-green));
+}
+
+.quark-history-line-delete {
+	color: var(--text-error);
+}
+
+.quark-reference-manager {
+	overflow: auto;
+	padding: var(--size-4-3);
+}
+
+.quark-reference-manager-actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: var(--size-4-2);
+}
+
+.quark-reference-manager-actions button[aria-pressed='true'] {
+	background: var(--interactive-accent);
+	color: var(--text-on-accent);
+}
+
+.quark-reference-manager-note {
+	border-top: 1px solid var(--background-modifier-border);
+	margin-top: var(--size-4-4);
+	overflow-wrap: anywhere;
+}
+
+.quark-reference-manager-note li + li {
+	margin-top: var(--size-4-3);
+}
+
+.quark-reference-manager-note li button {
+	margin-top: var(--size-4-1);
+}
+
+.quark-reference-manager-status {
+	color: var(--text-muted);
+	font-size: var(--font-ui-small);
+}
+
+.quark-dashboard-transfer p {
+	overflow-wrap: anywhere;
+}
