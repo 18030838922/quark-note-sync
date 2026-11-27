@@ -3,6 +3,7 @@ import { validateVaultPath } from './core.ts';
 export interface CloudAttachment {
 	size: number;
 	sha256: string;
+	headId?: string;
 	deferred: boolean;
 	pinned: boolean;
 }
@@ -24,7 +25,8 @@ export function normalizeCloudAttachments(input: unknown): CloudAttachmentIndex 
 		const data = candidate as Partial<CloudAttachment>;
 		if (typeof data.size !== 'number' || !Number.isSafeInteger(data.size) || data.size < 0 ||
 			typeof data.sha256 !== 'string' || !/^[a-f\d]{64}$/i.test(data.sha256)) continue;
-		result[path] = { size: data.size, sha256: data.sha256.toLowerCase(), deferred: data.deferred === true, pinned: data.pinned === true };
+		const headId = typeof data.headId === 'string' && /^[a-f\d]{64}$/i.test(data.headId) ? data.headId.toLowerCase() : undefined;
+		result[path] = { size: data.size, sha256: data.sha256.toLowerCase(), ...(headId ? { headId } : {}), deferred: data.deferred === true, pinned: data.pinned === true };
 	}
 	return result;
 }

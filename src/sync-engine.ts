@@ -1,5 +1,6 @@
 import { isSyncablePath, resolvePathEvents, validatePathSet, type ResolvedPath, type VersionEvent } from './core.ts';
 import { sha256Hex } from './hash.ts';
+import type { CloudAttachment } from './cloud-attachments.ts';
 
 export interface SyncSnapshot {
 	hash: string | null;
@@ -19,7 +20,7 @@ export interface PlanInput {
 	snapshots: Record<string, SyncSnapshot>;
 	remoteEvents: VersionEvent[];
 	managedPaths?: readonly string[];
-	deferredAttachments?: ReadonlySet<string>;
+	deferredAttachments?: ReadonlyMap<string, CloudAttachment>;
 	deviceId: string;
 	now: number;
 	configDir: string;
@@ -75,6 +76,7 @@ export async function buildSyncPlan(input: PlanInput): Promise<SyncPlan> {
 		...input.localFiles.map((file) => file.path).filter((path) => !managedPathKeys.has(pathKey(path))),
 		...Object.keys(input.snapshots).filter((path) => !managedPathKeys.has(pathKey(path))),
 		...remoteByPath.keys(),
+		...[...(input.deferredAttachments?.keys() ?? [])].filter((path) => !managedPathKeys.has(pathKey(path))),
 	]);
 	const validPaths: string[] = [];
 	for (const path of candidatePaths) {
@@ -110,6 +112,11 @@ export async function buildSyncPlan(input: PlanInput): Promise<SyncPlan> {
 		}
 		const remoteHistory = remoteByPath.get(path) ?? [];
 		const previous = hasOwn(input.snapshots, path) ? input.snapshots[path] : undefined;
+		const deferred = input.deferredAttachments?.get(path);
+		if (deferred && !remoteHistory.some((event) => deferred.headId ? event.id === deferred.headId : event.sha256 === deferred.sha256)) {
+			addSkipped(path, '夸克历史缺少已确认的附件版本，已暂停变更');
+			continue;
+		}
 		if (previous && remoteHistory.length > 0) {
 			const remoteIds = new Set(remoteHistory.map((event) => event.id));
 			if (previous.heads.some((head) => !remoteIds.has(head))) {
@@ -134,7 +141,7 @@ export async function buildSyncPlan(input: PlanInput): Promise<SyncPlan> {
 		let shouldRecord = false;
 		if (!previous) {
 			if (local && remoteState?.winner?.sha256 !== local.sha256) shouldRecord = true;
-		} else if (localHash !== previous.hash && (local || !input.deferredAttachments?.has(path))) {
+		} else if (localHash !== previous.hash && (local || !deferred)) {
 			const alreadyRepresented = remoteState?.heads.some((event) =>
 				local ? event.kind === 'file' && event.sha256 === local.sha256 : event.kind === 'delete',
 			) ?? false;

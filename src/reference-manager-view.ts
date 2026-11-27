@@ -1,4 +1,4 @@
-import { ItemView, MarkdownView, Notice, type Editor, type TFile, type WorkspaceLeaf } from 'obsidian';
+import { FileView, ItemView, MarkdownView, Notice, type Editor, type TFile, type WorkspaceLeaf } from 'obsidian';
 import { collectNoteReferences, getReferenceReplacement, indexLocalCopies, verifyReferences } from './reference-manager.ts';
 import type { QuarkReferenceRow, QuarkReferenceTarget, ReferenceStatus } from './reference-manager.ts';
 import { managedDownloadPaths, type SourceIndex } from './source-index.ts';
@@ -28,6 +28,7 @@ export class QuarkReferenceManagerView extends ItemView {
 	constructor(leaf: WorkspaceLeaf, actions: QuarkReferenceManagerActions) {
 		super(leaf);
 		this.actions = actions;
+		this.navigation = false;
 	}
 
 	getViewType(): string { return QUARK_REFERENCE_MANAGER_VIEW_TYPE; }
@@ -171,13 +172,19 @@ export class QuarkReferenceManagerView extends ItemView {
 			return;
 		}
 		try {
-			await this.app.workspace.getLeaf(false).openFile(file, { active: true, ...(line ? { eState: { line: line - 1 } } : {}) });
+			const { workspace } = this.app;
+			let existing: WorkspaceLeaf | undefined;
+			workspace.iterateRootLeaves((leaf) => {
+				if (!existing && leaf.view instanceof FileView && leaf.view.file === file) existing = leaf;
+			});
+			const leaf = existing ?? workspace.getLeaf('tab');
+			await leaf.openFile(file, { active: true, ...(line ? { eState: { line: line - 1 } } : {}) });
 		} catch {
 			new Notice(this.label('无法打开本地文件。', 'Could not open the local file.'));
 		}
 	}
 
-	private render(): void {
+	private render(focusFilter = false): void {
 		if (this.closed) return;
 		const content = this.contentEl;
 		const busy = Boolean(this.operation);
@@ -188,9 +195,10 @@ export class QuarkReferenceManagerView extends ItemView {
 		this.addButton(controls, this.label('检查链接', 'Check links'), () => this.verify(), busy || !this.rows.length);
 		const filter = this.addButton(controls, this.label('仅显示失效', 'Broken only'), () => {
 			this.brokenOnly = !this.brokenOnly;
-			this.render();
+			this.render(content.ownerDocument.activeElement === filter);
 		}, busy);
 		filter.setAttribute('aria-pressed', String(this.brokenOnly));
+		if (focusFilter) filter.focus({ preventScroll: true });
 		if (this.operationKind === 'replace') {
 			this.addButton(controls, this.label('取消选择', 'Cancel selection'), () => this.operation?.abort());
 		}

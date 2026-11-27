@@ -131,12 +131,13 @@ function findNoteReferences(markdown: string): ReferenceOccurrence[] {
 		.sort((a, b) => a.from - b.from);
 	const pasted: ReferenceOccurrence[] = [];
 	let index = 0;
-	for (const match of visible.matchAll(/\b(?:https:\/\/pan\.quark\.cn\/s\/|obsidian:\/\/quark-note\?)[^\s<>()]+/gi)) {
-		const from = match.index;
+	for (const match of visible.matchAll(/<([a-z][a-z\d+.-]*:\/\/[^\s<>]+)>|\b([a-z][a-z\d+.-]*:\/\/[^\s<>()，。！？；、：）】》」』]+)/gi)) {
+		const angled = match[1] !== undefined;
+		const from = match.index + (angled ? 1 : 0);
 		while (occurrences[index] && occurrences[index].to <= from) index += 1;
 		if (occurrences[index] && occurrences[index].from <= from) continue;
-		const angled = visible[from - 1] === '<' && visible[from + match[0].length] === '>';
-		const url = angled ? match[0] : match[0].replace(/[\],.;!?]+$/g, '');
+		const url = angled ? match[1] : match[2].replace(/[\],.;!?]+$/g, '');
+		if (!/^(?:https:\/\/pan\.quark\.cn\/s\/|obsidian:\/\/quark-note\?)/i.test(url)) continue;
 		const share = parseOfficialShareUrl(url);
 		const personal = share ? null : parsePersonalReference(url);
 		const target: QuarkReferenceTarget | undefined = share ? { kind: 'share', reference: share }

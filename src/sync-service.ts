@@ -285,7 +285,8 @@ export class QuarkSyncService {
 				progress?.({ path: pathPlan.path, phase: 'apply' });
 				if (pathPlan.deferred) {
 					const { path, result } = pathPlan;
-					await this.setAttachment(path, { size: result.winner!.size!, sha256: result.winner!.sha256!, deferred: true, pinned: false });
+					const winner = result.winner!;
+					await this.setAttachment(path, { size: winner.size!, sha256: winner.sha256!, headId: winner.id, deferred: true, pinned: false });
 					continue;
 				}
 				const result = await this.applyPath(layout, pathPlan, progress);
@@ -321,7 +322,7 @@ export class QuarkSyncService {
 		if (!winner?.sha256 || winner.size === undefined) {
 			await this.setAttachment(pathPlan.path, undefined);
 		} else {
-			await this.setAttachment(pathPlan.path, { ...previous, deferred: false, size: winner.size, sha256: winner.sha256 });
+			await this.setAttachment(pathPlan.path, { ...previous, deferred: false, size: winner.size, sha256: winner.sha256, headId: winner.id });
 		}
 	}
 
@@ -335,7 +336,7 @@ export class QuarkSyncService {
 		const result = await this.applyPath(layout, plan, progress);
 		if (result === 'skipped') throw new Error('本地文件已变化，请重试');
 		const winner = plan.result.winner!;
-		retained = { ...retained, size: winner.size!, sha256: winner.sha256!, deferred: false };
+		retained = { ...retained, size: winner.size!, sha256: winner.sha256!, headId: winner.id, deferred: false };
 		await this.setAttachment(path, retained);
 	}
 
@@ -348,8 +349,14 @@ export class QuarkSyncService {
 		}
 		await this.downloadBlob(layout, winner);
 		// Persist the local-only removal intent before touching the vault. A retry cannot publish a tombstone.
-		await this.setAttachment(path, { size: winner.size!, sha256: winner.sha256!, deferred: true, pinned: false });
-		await this.local.trash(path, this.app.vault.configDir, plan.expectedLocalHash);
+		await this.setAttachment(path, { size: winner.size!, sha256: winner.sha256!, headId: winner.id, deferred: true, pinned: false });
+		try {
+			await this.local.trash(path, this.app.vault.configDir, plan.expectedLocalHash);
+		} catch (error) {
+			const stillLocal = await this.local.currentHash(path).then((hash) => hash !== null, () => false);
+			if (stillLocal) await this.setAttachment(path, entry);
+			throw error;
+		}
 	}
 
 	private async readManagedAttachment(path: string): Promise<{ layout: CloudLayout; plan: SyncPlan['paths'][number]; entry: CloudAttachment }> {
@@ -358,7 +365,11 @@ export class QuarkSyncService {
 		await this.client.checkConnection();
 		const remote = await this.readRemoteContext();
 		const scope = this.excludedPaths(remote.events);
-		const plan = (await this.makePlan(remote.events, scope, path)).paths.find((item) => item.path === path);
+		await this.recoverPendingApplies(scope, path);
+		const preview = await this.makePlan(remote.events, scope, path);
+		const skipped = preview.skipped.find((item) => item.path === path);
+		if (skipped) throw new Error(skipped.reason);
+		const plan = preview.paths.find((item) => item.path === path);
 		const winner = plan?.result.winner;
 		if (!plan || !remote.layout || plan.result.heads.length !== 1 || !winner?.sha256 || winner.size === undefined) {
 			throw new Error('此附件已删除、存在冲突或不在当前设备同步范围内');
@@ -371,7 +382,8 @@ export class QuarkSyncService {
 		const index = this.state.cloudAttachments;
 		if (!index) return;
 		const prior = index[path];
-		if (prior?.sha256 === item?.sha256 && prior?.size === item?.size && prior?.deferred === item?.deferred && prior?.pinned === item?.pinned) return;
+		if (prior?.sha256 === item?.sha256 && prior?.size === item?.size && prior?.headId === item?.headId &&
+			prior?.deferred === item?.deferred && prior?.pinned === item?.pinned) return;
 		if (item) index[path] = item;
 		else delete index[path];
 		try {
@@ -394,7 +406,7 @@ export class QuarkSyncService {
 			} catch { return false; }
 		};
 		const local = this.app.vault.getFiles().filter((file) => check(file.path)).map((file) => ({ path: file.path, size: file.stat.size }));
-		const savedPaths = [...Object.keys(this.state.snapshots), ...Object.keys(this.state.pendingApplies)].filter(check);
+		const savedPaths = [...Object.keys(this.state.snapshots), ...Object.keys(this.state.pendingApplies), ...Object.keys(this.state.cloudAttachments ?? {})].filter(check);
 		return selectSyncScope(scope, local, events.filter((event) => check(event.path)), savedPaths);
 	}
 
@@ -415,7 +427,8 @@ export class QuarkSyncService {
 			snapshots: Object.fromEntries(Object.entries(this.state.snapshots).filter(([path]) => (!scanPath || path === scanPath) && !excludedKeys.has(pathKey(path)))),
 			remoteEvents: remoteEvents.filter((event) => (!scanPath || event.path === scanPath) && !excludedKeys.has(pathKey(event.path))),
 			managedPaths: [...managedPaths],
-			deferredAttachments: new Set(Object.entries(this.state.cloudAttachments ?? {}).filter(([, item]) => item.deferred).map(([path]) => path)),
+			deferredAttachments: new Map(Object.entries(this.state.cloudAttachments ?? {}).filter(([path, item]) =>
+				item.deferred && (!scanPath || path === scanPath) && !excludedKeys.has(pathKey(path)))),
 			deviceId: this.state.deviceId,
 			now: Date.now(),
 			configDir: this.app.vault.configDir,
@@ -559,7 +572,7 @@ export class QuarkSyncService {
 		await flushLocal?.();
 		const currentHash = await this.local.currentHash(pathPlan.path);
 		if (currentHash !== pathPlan.expectedLocalHash) {
-			await this.acknowledgeAndClearPending(pathPlan);
+			await this.clearPendingApply(pathPlan.path);
 			return 'skipped';
 		}
 
@@ -577,13 +590,13 @@ export class QuarkSyncService {
 				);
 			} catch (error) {
 				if (await this.local.currentHash(pathPlan.path).catch(() => '__read-error__') !== pathPlan.expectedLocalHash) {
-					await this.acknowledgeAndClearPending(pathPlan);
+					await this.clearPendingApply(pathPlan.path);
 					return 'skipped';
 				}
 				throw error;
 			}
 			if (!removed) {
-				await this.acknowledgeAndClearPending(pathPlan);
+				await this.clearPendingApply(pathPlan.path);
 				return 'skipped';
 			}
 			await this.acknowledgeAndClearPending(pathPlan);
@@ -606,13 +619,17 @@ export class QuarkSyncService {
 			);
 		} catch (error) {
 			if (await this.local.currentHash(pathPlan.path).catch(() => '__read-error__') !== pathPlan.expectedLocalHash) {
-				await this.acknowledgeAndClearPending(pathPlan);
+				await this.clearPendingApply(pathPlan.path);
 				return 'skipped';
 			}
 			throw error;
 		}
+		if (!written) {
+			await this.clearPendingApply(pathPlan.path);
+			return 'skipped';
+		}
 		await this.acknowledgeAndClearPending(pathPlan);
-		return written ? 'downloaded' : 'skipped';
+		return 'downloaded';
 	}
 
 	private async downloadWithProgress(layout: CloudLayout, event: VersionEvent, progress?: (state: SyncProgress) => void): Promise<Uint8Array> {
@@ -664,7 +681,11 @@ export class QuarkSyncService {
 			hash: pathPlan.nextSnapshot.hash,
 			heads: [...pathPlan.nextSnapshot.heads],
 		};
-		delete this.state.pendingApplies[pathPlan.path];
+		await this.clearPendingApply(pathPlan.path);
+	}
+
+	private async clearPendingApply(path: string): Promise<void> {
+		delete this.state.pendingApplies[path];
 		await this.state.persist();
 	}
 

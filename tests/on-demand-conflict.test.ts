@@ -7,7 +7,7 @@ import { findDeferredAttachment, normalizeCloudAttachments } from '../src/cloud-
 import { sha256Hex } from '../src/hash.ts';
 import { createBatchManifest } from '../src/manifest.ts';
 import type { QuarkClient, RemoteFile } from '../src/quark-api.ts';
-import { QuarkSyncService } from '../src/sync-service.ts';
+import { QuarkSyncService, type SyncStatePort } from '../src/sync-service.ts';
 
 const text = (value: string) => new TextEncoder().encode(value);
 
@@ -48,13 +48,14 @@ function makeCloud() {
 		const vaultId = await sha256Hex(text('quark-vault:' + root));
 		const manifest = await createBatchManifest(vaultId, deviceId, [{ id, ...body }]);
 		await client.uploadFile(blobs, sha256 + '.bin', value);
-		await client.uploadFile(device, manifest.batchId + '.json', manifest.bytes);
-		return { id, sha256 };
+		const name = manifest.batchId + '.json';
+		await client.uploadFile(device, name, manifest.bytes);
+		return { id, sha256, hideManifest: () => folder(device).delete(name) };
 	};
 	return { client: client as unknown as QuarkClient, seedBranch };
 }
 
-function makeDevice(client: QuarkClient, deviceId: string, mode = false) {
+function makeDevice(client: QuarkClient, deviceId: string, mode = false, beforeTrash?: (path: string) => void) {
 	const files = new Map<string, Uint8Array>();
 	const get = (path: string) => files.has(path) ? { path, extension: path.split('.').pop(), stat: { size: files.get(path)!.byteLength } } : null;
 	const app = {
@@ -67,9 +68,12 @@ function makeDevice(client: QuarkClient, deviceId: string, mode = false) {
 			modifyBinary: async ({ path }: { path: string }, bytes: ArrayBuffer) => { files.set(path, new Uint8Array(bytes)); },
 			adapter: { exists: async (path: string) => files.has(path) },
 		},
-		fileManager: { trashFile: async ({ path }: { path: string }) => { files.delete(path); } },
+		fileManager: { trashFile: async ({ path }: { path: string }) => { beforeTrash?.(path); files.delete(path); } },
 	} as unknown as App;
-	const state = { deviceId, snapshots: {}, pendingApplies: {}, cloudAttachments: normalizeCloudAttachments(undefined), persist: async () => {} };
+	const state = {
+		deviceId, snapshots: {} as SyncStatePort['snapshots'], pendingApplies: {} as SyncStatePort['pendingApplies'],
+		cloudAttachments: normalizeCloudAttachments(undefined), persist: async () => {},
+	};
 	const service = new QuarkSyncService(app, client, { cloudDirectoryName: 'notes', attachmentsOnDemand: mode }, state);
 	return { service, files, state };
 }
@@ -109,6 +113,91 @@ test('on-demand attachment downloads, pins and clears locally while preserving t
 	assert.equal(local.state.cloudAttachments[path].size, next.byteLength);
 	await local.service.downloadAttachment(path, false);
 	assert.deepEqual(local.files.get(path), next);
+});
+
+test('a deferred attachment rejects cloud history missing its last observed version', async () => {
+	const cloud = makeCloud();
+	const { service, files } = makeDevice(cloud.client, 'phone', true);
+	const path = 'lecture.pdf';
+	const bytes = text('same bytes in both versions');
+	const first = await cloud.seedBranch(path, bytes, 'desktop');
+	await service.sync();
+	const second = await cloud.seedBranch(path, bytes, 'desktop', [first.id]);
+	await service.sync();
+	second.hideManifest();
+
+	assert.deepEqual((await service.preview()).skipped.map((item) => item.path), [path]);
+	assert.deepEqual((await service.sync()).skipped.map((item) => item.path), [path]);
+	await assert.rejects(() => service.downloadAttachment(path, false), /历史缺少/);
+	assert.equal(files.has(path), false);
+});
+
+test('a legacy deferred attachment keeps its known content when cloud history is incomplete', async () => {
+	const cloud = makeCloud();
+	const { service, state } = makeDevice(cloud.client, 'phone', true);
+	const path = 'lecture.pdf';
+	const first = await cloud.seedBranch(path, text('older edition'), 'desktop');
+	const bytes = text('edition already seen');
+	state.cloudAttachments[path] = { size: bytes.byteLength, sha256: await sha256Hex(bytes), deferred: true, pinned: false };
+
+	assert.deepEqual((await service.sync()).skipped.map((item) => item.path), [path]);
+	assert.equal(state.cloudAttachments[path].size, bytes.byteLength);
+	await cloud.seedBranch(path, bytes, 'desktop', [first.id]);
+	assert.deepEqual((await service.sync()).skipped, []);
+});
+
+test('a failed eviction keeps the existing attachment pinned', async () => {
+	const cloud = makeCloud();
+	const { service, files, state } = makeDevice(cloud.client, 'phone', true, () => {
+		throw new Error('trash unavailable');
+	});
+	const path = 'lecture.pdf';
+	const bytes = text('offline copy');
+	await cloud.seedBranch(path, bytes, 'desktop');
+	await service.sync();
+	await service.downloadAttachment(path, true);
+
+	await assert.rejects(() => service.evictAttachment(path), /trash unavailable/);
+	assert.deepEqual(files.get(path), bytes);
+	assert.equal(state.cloudAttachments[path].deferred, false);
+	assert.equal(state.cloudAttachments[path].pinned, true);
+});
+
+test('a new local attachment during download does not supersede a cloud version it never received', async () => {
+	const cloud = makeCloud();
+	const { service, files } = makeDevice(cloud.client, 'phone', true);
+	const path = 'lecture.pdf';
+	const first = await cloud.seedBranch(path, text('first edition'), 'desktop');
+	await service.sync();
+	await service.downloadAttachment(path, false);
+	await service.evictAttachment(path);
+	const second = await cloud.seedBranch(path, text('cloud edit'), 'desktop', [first.id]);
+	await service.sync();
+
+	const localEdit = text('local edit');
+	await assert.rejects(() => service.downloadAttachment(path, false, (progress) => {
+		if (progress.phase === 'download' && progress.bytes) files.set(path, localEdit);
+	}), /本地文件已变化/);
+	assert.deepEqual(files.get(path), localEdit);
+	const preview = await service.preview();
+	assert.deepEqual(preview.events[0]?.parents, [first.id]);
+	assert.ok(preview.paths[0]?.result.heads.some((event) => event.id === second.id));
+});
+
+test('eviction recovers a completed apply before accepting the current cloud history', async () => {
+	const cloud = makeCloud();
+	const { service, files, state } = makeDevice(cloud.client, 'phone', true);
+	const path = 'lecture.pdf';
+	const bytes = text('unchanged offline copy');
+	const first = await cloud.seedBranch(path, bytes, 'desktop');
+	await service.sync();
+	await service.downloadAttachment(path, true);
+	const second = await cloud.seedBranch(path, bytes, 'desktop', [first.id]);
+	state.pendingApplies[path] = { beforeHash: first.sha256, desiredHash: second.sha256, heads: [second.id] };
+	second.hideManifest();
+
+	await assert.rejects(() => service.evictAttachment(path), /历史缺少/);
+	assert.deepEqual(files.get(path), bytes);
 });
 
 test('conflict resolution rejects stale requests and preserves unpublished local edits before resolving', async () => {

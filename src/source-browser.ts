@@ -1,6 +1,7 @@
 import { mountQuarkVideo, type VideoStream } from './video-stream.ts';
 import { ItemView, Notice, Platform, type WorkspaceLeaf } from 'obsidian';
 import { mountMobilePdfPreview, type PdfReadingPosition } from './pdf-preview.ts';
+import { createMobileMediaSurface } from './preview-pinch.ts';
 import type { RemoteDirectoryPage, RemoteFile } from './quark-api.ts';
 import { parseOfficialShareUrl, type PreviewKind } from './quark-references.ts';
 import {
@@ -131,7 +132,7 @@ export class QuarkBrowserView extends ItemView {
 			return;
 		}
 		this.mode = 'personal';
-		await this.loadPersonal('0', this.personalRoot());
+		void this.loadPersonal('0', this.personalRoot());
 	}
 
 	async onOpen(): Promise<void> {
@@ -145,6 +146,7 @@ export class QuarkBrowserView extends ItemView {
 		this.cancelSelection();
 		this.shareSession = undefined;
 		this.officialShareUrl = undefined;
+		this.insertionTarget = undefined;
 	}
 
 	clearSensitiveState(): void {
@@ -160,7 +162,9 @@ export class QuarkBrowserView extends ItemView {
 	}
 
 	setInsertionTarget(target?: SourceEditorTarget): void {
+		if (this.insertionTarget === target) return;
 		this.insertionTarget = target;
+		this.render();
 	}
 
 	setSelectionHandler(choose?: PersonalFileSelection['choose'], cancel?: () => void): void {
@@ -189,6 +193,7 @@ export class QuarkBrowserView extends ItemView {
 		this.mode = 'share';
 		this.shareSession = undefined;
 		this.officialShareUrl = parsed.officialUrl;
+		this.crumbs = [{ fid: '0', name: this.label('分享文件', 'Shared files') }];
 		this.passcodeRequired = false;
 		this.loading = true;
 		this.error = '';
@@ -251,11 +256,15 @@ export class QuarkBrowserView extends ItemView {
 				{ fid: '0', name: this.label('分享文件', 'Shared files') },
 				{ fid: selectedParent, name: this.label('分享文件夹', 'Shared folder') },
 			];
-		await this.loadShare(selectedParent, crumbs);
+		if (!await this.loadShare(selectedParent, crumbs)) return;
 		if (this.shareSession !== session || this.officialShareUrl !== parsed.officialUrl) return;
 		if (parsed.selectedFid) {
 			const selected = this.entries.find((entry) => entry.fid === parsed.selectedFid);
-			if (selected && !selected.isDirectory) this.openShareFile(selected as ShareEntryLike);
+			if (selected && !selected.isDirectory) {
+				void this.openShareFile(selected as ShareEntryLike).catch((error) => {
+					new Notice(error instanceof Error ? error.message : this.label('分享预览失败。', 'Share preview failed.'));
+				});
+			}
 		}
 	}
 
@@ -285,8 +294,8 @@ export class QuarkBrowserView extends ItemView {
 		this.render();
 	}
 
-	private async loadShare(fid: string, crumbs: DirectoryCrumb[]): Promise<void> {
-		if (!this.shareSession) return;
+	private async loadShare(fid: string, crumbs: DirectoryCrumb[]): Promise<boolean> {
+		if (!this.shareSession) return false;
 		const requestId = ++this.requestId;
 		this.mode = 'share';
 		this.crumbs = crumbs;
@@ -296,15 +305,16 @@ export class QuarkBrowserView extends ItemView {
 		this.render();
 		try {
 			const entries = await this.actions.listShare(this.shareSession, fid);
-			if (requestId !== this.requestId) return;
+			if (requestId !== this.requestId) return false;
 			this.entries = entries;
 		} catch (error) {
-			if (requestId !== this.requestId) return;
+			if (requestId !== this.requestId) return false;
 			this.entries = [];
 			this.error = error instanceof Error ? error.message : this.label('无法读取分享目录。', 'Could not load this shared folder.');
 		}
 		this.loading = false;
 		this.render();
+		return !this.error;
 	}
 
 	private render(): void {
@@ -314,7 +324,7 @@ export class QuarkBrowserView extends ItemView {
 			: this.fileSelection
 				? this.label('选择夸克网盘文件', 'Select a Quark Drive file')
 				: this.label('浏览夸克网盘', 'Browse Quark Drive');
-		this.contentEl.createEl('p', { cls: 'quark-browser-title', text: title });
+		this.contentEl.createEl('h2', { cls: 'quark-browser-title', text: title });
 		const toolbar = this.contentEl.createDiv({ cls: 'quark-browser-toolbar' });
 		if (this.fileSelection) {
 			this.addButton(toolbar, this.label('取消选择', 'Cancel selection'), () => this.setSelectionHandler(), this.fileSelection.busy);
@@ -336,14 +346,20 @@ export class QuarkBrowserView extends ItemView {
 			else void this.loadPersonal(parent.fid, next);
 		}, this.crumbs.length <= 1);
 		if (this.mode === 'share') {
-			this.addButton(toolbar, this.label('在夸克官方页面打开', 'Open in Quark'), () => {
-				if (this.officialShareUrl) this.actions.openOfficialShare(this.officialShareUrl);
-			});
+			if (this.shareSession) {
+				const current = this.crumbs[this.crumbs.length - 1];
+				this.addButton(toolbar, this.label('刷新', 'Refresh'), () => void this.loadShare(current.fid, this.crumbs), this.loading);
+			}
+			if (this.officialShareUrl) {
+				this.addButton(toolbar, this.label('在夸克官方页面打开', 'Open in Quark'), () => {
+					if (this.officialShareUrl) this.actions.openOfficialShare(this.officialShareUrl);
+				});
+			}
 		} else {
 			const current = this.crumbs[this.crumbs.length - 1];
 			this.addButton(toolbar, this.label('刷新', 'Refresh'), () => {
 				void this.loadPersonal(current.fid, this.crumbs, false);
-			});
+			}, this.loading);
 			if (current.fid !== '0' && !this.loading && !this.error) {
 				const isFavorite = this.actions.getPersonalDirectoryShortcuts().favorites.some((path) => path[path.length - 1].fid === current.fid);
 				const title = isFavorite ? this.label('取消收藏', 'Remove favorite') : this.label('收藏此目录', 'Favorite this folder');
@@ -363,36 +379,38 @@ export class QuarkBrowserView extends ItemView {
 			});
 		}
 		if (this.mode === 'share' && !this.shareSession) {
-			const shareRow = this.contentEl.createDiv({ cls: 'quark-browser-share-input' });
-			if (this.passcodeRequired) {
-				const password = shareRow.createEl('input');
-				password.type = 'password';
-				password.autocomplete = 'off';
-				password.placeholder = this.label('输入提取码', 'Enter passcode');
-				password.setAttribute('aria-label', this.label('分享提取码', 'Share passcode'));
-				this.addButton(shareRow, this.label('提交提取码', 'Submit passcode'), () => void this.submitPasscode(password));
-			} else {
-				const linkInput = shareRow.createEl('input');
-				linkInput.type = 'url';
-				linkInput.autocomplete = 'off';
-				linkInput.placeholder = this.label('粘贴 pan.quark.cn 官方分享链接', 'Paste an official pan.quark.cn share link');
-				this.addButton(shareRow, this.label('只读打开', 'Open read only'), () => void this.submitShareUrl(linkInput));
-			}
+			this.renderShareForm();
 		}
-		if (this.loading) this.contentEl.createEl('p', { text: this.label('正在读取…', 'Loading…') });
+		if (this.loading) this.contentEl.createEl('p', { text: this.label('正在读取…', 'Loading…'), attr: { role: 'status' } });
 		if (this.error) {
-			this.contentEl.createEl('p', { cls: 'quark-browser-error', text: this.error });
-			if (this.mode === 'share' && this.officialShareUrl) {
-				this.addButton(this.contentEl, this.label('在夸克官方页面打开', 'Open in Quark'), () => {
-					if (this.officialShareUrl) this.actions.openOfficialShare(this.officialShareUrl);
-				});
-			}
+			this.contentEl.createEl('p', { cls: 'quark-browser-error', text: this.error, attr: { role: 'alert' } });
 		}
 		const list = this.contentEl.createDiv({ cls: 'quark-browser-list' });
 		for (const entry of this.entries) this.renderEntry(list, entry);
 		if (!this.loading && !this.error && this.entries.length === 0) {
 			list.createEl('p', { text: this.label('此目录为空。', 'This folder is empty.') });
 		}
+	}
+
+	private renderShareForm(): void {
+		const form = this.contentEl.createEl('form', { cls: 'quark-browser-share-input' });
+		const passcode = this.passcodeRequired;
+		const label = passcode
+			? this.label('输入提取码', 'Enter passcode')
+			: this.label('粘贴 pan.quark.cn 官方分享链接', 'Paste an official pan.quark.cn share link');
+		const input = form.createEl('input', { attr: {
+			type: passcode ? 'password' : 'url', autocomplete: 'off', required: '',
+			placeholder: label, 'aria-label': label,
+		} });
+		const submit = form.createEl('button', { text: passcode
+			? this.label('提交提取码', 'Submit passcode')
+			: this.label('只读打开', 'Open read only'), attr: { type: 'submit' } });
+		input.disabled = submit.disabled = this.loading;
+		form.addEventListener('submit', (event) => {
+			event.preventDefault();
+			if (this.loading || !input.value.trim()) return;
+			void (passcode ? this.submitPasscode(input) : this.submitShareUrl(input));
+		});
 	}
 
 	private personalRoot(): DirectoryCrumb[] {
@@ -585,64 +603,82 @@ export class QuarkBrowserView extends ItemView {
 	}
 
 	private renderEntry(container: HTMLElement, entry: RemoteFile | ShareEntryLike, ancestors = this.crumbs): void {
-		const row = container.createDiv({ cls: 'quark-browser-entry' });
+		const row = container.createDiv({ cls: 'quark-browser-entry quark-browser-file-row' });
 		const isShare = this.mode === 'share';
+		const session = this.shareSession;
 		const parent = ancestors[ancestors.length - 1].fid;
-		const selection = isShare || entry.isDirectory ? undefined : this.fileSelection;
-		const open = () => {
-			if (entry.isDirectory) {
+		const target = this.insertionTarget;
+		const heading = row.createDiv({ cls: 'quark-browser-file-heading' });
+		const name = heading.createEl('button', {
+			cls: 'quark-browser-entry-name',
+			text: (entry.isDirectory ? '▸ ' : '') + entry.name,
+			attr: { type: 'button', 'aria-label': entry.name },
+		});
+		if (entry.isDirectory) {
+			name.addEventListener('click', () => {
 				const crumbs = [...ancestors, { fid: entry.fid, name: entry.name }];
 				if (isShare) void this.loadShare(entry.fid, crumbs);
 				else void this.loadPersonal(entry.fid, crumbs);
-			} else if (isShare) {
-				this.openShareFile(entry as ShareEntryLike);
-			} else if (selection) {
-				void this.chooseFile(selection, entry, parent);
-			} else {
-				void this.actions.previewPersonal(entry, parent, this.insertionTarget).catch((error) => {
-					new Notice(error instanceof Error ? error.message : this.label('预览失败。', 'Preview failed.'));
-				});
+			});
+			return;
+		}
+
+		heading.createSpan({ cls: 'quark-browser-size', text: formatBytes(entry.size) });
+		const actions = row.createDiv({ cls: 'quark-browser-file-actions' });
+		const selection = isShare ? undefined : this.fileSelection;
+		if (selection) {
+			const choose = () => void this.chooseFile(selection, entry, parent);
+			name.disabled = selection.busy;
+			name.addEventListener('click', choose);
+			this.addButton(actions, this.label('选择此文件', 'Select file'), choose, selection.busy);
+			return;
+		}
+
+		const status = row.createDiv({ cls: 'quark-browser-file-status', attr: { role: 'status' } });
+		let pending = false;
+		const run = async (message: string, action: () => Promise<void>) => {
+			if (pending) return;
+			pending = true;
+			const buttons = row.querySelectorAll('button');
+			buttons.forEach((button) => { button.disabled = true; });
+			status.setText(message);
+			try {
+				await action();
+			} catch (error) {
+				new Notice(error instanceof Error ? error.message : this.label('文件操作失败。', 'File action failed.'));
+			} finally {
+				pending = false;
+				buttons.forEach((button) => { button.disabled = false; });
+				status.setText('');
 			}
 		};
-		const openButton = row.createEl('button', { cls: 'quark-browser-entry-name', text: `${entry.isDirectory ? '▸ ' : ''}${entry.name}` });
-		openButton.setAttribute('type', 'button');
-		openButton.setAttribute('aria-label', entry.name);
-		openButton.disabled = selection?.busy ?? false;
-		openButton.addEventListener('click', open);
-		if (selection) {
-			this.addButton(row, this.label('选择此文件', 'Select file'), open, selection.busy);
-		} else if (!entry.isDirectory && !isShare) {
-			this.addButton(row, this.label('仅插入链接', 'Insert link only'), () => {
-				void this.actions.insertReference(entry, parent, this.insertionTarget).catch((error) => {
-					new Notice(error instanceof Error ? error.message : this.label('无法插入引用。', 'Could not insert reference.'));
-				});
-			});
-			this.addButton(row, this.label('下载到仓库并插入', 'Download to vault and insert'), () => {
-				void this.actions.downloadPersonal(entry, parent, this.insertionTarget).catch((error) => {
-					new Notice(error instanceof Error ? error.message : this.label('下载失败。', 'Download failed.'));
-				});
-			});
-		} else if (!entry.isDirectory && isShare && this.shareSession) {
+		const insert = (action: () => Promise<void>) =>
+			void run(this.label('正在插入引用…', 'Inserting link…'), action);
+		const download = (action: () => Promise<void>) =>
+			void run(this.label('正在下载…', 'Downloading…'), action);
+		const insertLabel = this.label('仅插入链接', 'Insert link only');
+		const downloadLabel = target
+			? this.label('下载到仓库并插入', 'Download to vault and insert')
+			: this.label('下载到仓库', 'Download to vault');
+
+		if (isShare && session) {
 			const shared = entry as ShareEntryLike;
-			this.addButton(row, this.label('仅插入链接', 'Insert link only'), () => {
-				void this.actions.insertShareReference(this.shareSession!, shared, parent, this.insertionTarget).catch((error) => {
-					new Notice(error instanceof Error ? error.message : this.label('无法插入分享链接。', 'Could not insert share link.'));
-				});
-			});
-			if (entry.name.toLowerCase().endsWith('.pdf')) this.addButton(row, this.label('下载到仓库并插入', 'Download to vault and insert'), () => {
-				void this.actions.downloadShare(this.shareSession!, shared, parent, this.insertionTarget).catch((error) => {
-					new Notice(error instanceof Error ? error.message : this.label('无法下载此分享文件。', 'Could not download this shared file.'));
-				});
-			});
+			name.addEventListener('click', () => void run(this.label('正在打开预览…', 'Opening preview…'), () => this.openShareFile(shared)));
+			if (target) this.addButton(actions, insertLabel, () => insert(() => this.actions.insertShareReference(session, shared, parent, target)));
+			if (entry.name.toLowerCase().endsWith('.pdf')) {
+				this.addButton(actions, downloadLabel, () => download(() => this.actions.downloadShare(session, shared, parent, target)));
+			}
+		} else if (!isShare) {
+			name.addEventListener('click', () => void run(this.label('正在打开预览…', 'Opening preview…'),
+				() => this.actions.previewPersonal(entry, parent, target)));
+			if (target) this.addButton(actions, insertLabel, () => insert(() => this.actions.insertReference(entry, parent, target)));
+			this.addButton(actions, downloadLabel, () => download(() => this.actions.downloadPersonal(entry, parent, target)));
 		}
-		row.createSpan({ cls: 'quark-browser-size', text: entry.isDirectory ? '' : formatBytes(entry.size) });
 	}
 
-	private openShareFile(file: ShareEntryLike): void {
+	private async openShareFile(file: ShareEntryLike): Promise<void> {
 		if (!this.shareSession || !this.officialShareUrl) return;
-		void this.actions.previewShare(this.shareSession, file, this.officialShareUrl).catch((error) => {
-			new Notice(error instanceof Error ? error.message : this.label('分享预览失败。', 'Share preview failed.'));
-		});
+		await this.actions.previewShare(this.shareSession, file, this.officialShareUrl);
 	}
 
 	private addButton(container: HTMLElement, title: string, callback: () => void, disabled = false): void {
@@ -661,6 +697,7 @@ export class QuarkPreviewView extends ItemView {
 	private payload: PreviewPayload | undefined;
 	private stopVideo?: () => void;
 	private stopPdf?: () => void;
+	private stopPinch?: () => void;
 	private objectUrl: string | undefined;
 	private readonly getLanguage: () => 'zh-CN' | 'en';
 
@@ -712,6 +749,8 @@ export class QuarkPreviewView extends ItemView {
 	private render(): void {
 		this.contentEl.empty();
 		this.contentEl.addClass('quark-preview-content');
+		this.contentEl.toggleClass('quark-mobile-preview', Platform.isMobileApp);
+		this.contentEl.scrollTop = this.contentEl.scrollLeft = 0;
 		const payload = this.payload;
 		if (!payload) {
 			this.contentEl.createEl('p', { text: this.label(
@@ -723,7 +762,7 @@ export class QuarkPreviewView extends ItemView {
 		this.contentEl.createEl('p', { cls: 'quark-preview-title', text: payload.name });
 		if (payload.message) this.contentEl.createEl('p', { text: payload.message });
 		if (payload.stream) {
-			this.stopVideo = mountQuarkVideo(this.contentEl, payload.stream);
+			this.stopVideo = mountQuarkVideo(this.previewMediaContainer(), payload.stream);
 			return;
 		}
 		if (payload.kind === 'unsupported') {
@@ -736,7 +775,7 @@ export class QuarkPreviewView extends ItemView {
 			return;
 		}
 		if (payload.kind === 'document' && payload.text !== undefined) {
-			this.contentEl.createEl('pre', { cls: 'quark-preview-text', text: payload.text });
+			this.previewMediaContainer().createEl('pre', { cls: 'quark-preview-text', text: payload.text });
 			return;
 		}
 		if (!payload.bytes || !payload.mimeType) {
@@ -747,27 +786,36 @@ export class QuarkPreviewView extends ItemView {
 			this.renderMobilePdf(payload, payload.bytes);
 			return;
 		}
+		const media = this.previewMediaContainer();
 		const buffer = payload.bytes.buffer.slice(payload.bytes.byteOffset, payload.bytes.byteOffset + payload.bytes.byteLength) as ArrayBuffer;
 		this.objectUrl = URL.createObjectURL(new Blob([buffer], { type: payload.mimeType }));
 		if (payload.kind === 'image') {
-			const image = this.contentEl.createEl('img', { cls: 'quark-preview-image' });
+			const image = media.createEl('img', { cls: 'quark-preview-image' });
 			image.src = this.objectUrl;
 			image.alt = payload.name;
 		} else if (payload.kind === 'audio') {
-			const audio = this.contentEl.createEl('audio', { cls: 'quark-preview-audio' });
+			const audio = media.createEl('audio', { cls: 'quark-preview-audio' });
 			audio.controls = true;
 			audio.preload = 'none';
 			audio.src = this.objectUrl;
 		} else if (payload.kind === 'video') {
-			const video = this.contentEl.createEl('video', { cls: 'quark-preview-video' });
+			const video = media.createEl('video', { cls: 'quark-preview-video' });
 			video.controls = true;
+			video.playsInline = true;
 			video.preload = 'none';
 			video.src = this.objectUrl;
 		} else if (payload.kind === 'document') {
-			const frame = this.contentEl.createEl('iframe', { cls: 'quark-preview-pdf' });
+			const frame = media.createEl('iframe', { cls: 'quark-preview-pdf' });
 			frame.src = this.objectUrl;
 			frame.title = payload.name;
 		}
+	}
+
+	private previewMediaContainer(): HTMLElement {
+		if (!Platform.isMobileApp) return this.contentEl;
+		const surface = createMobileMediaSurface(this.contentEl);
+		this.stopPinch = surface.dispose;
+		return surface.content;
 	}
 
 	private renderMobilePdf(payload: PreviewPayload, bytes: Uint8Array): void {
@@ -788,6 +836,8 @@ export class QuarkPreviewView extends ItemView {
 	}
 
 	private revokeObjectUrl(): void {
+		this.stopPinch?.();
+		this.stopPinch = undefined;
 		this.stopPdf?.();
 		this.stopPdf = undefined;
 		this.stopVideo?.();

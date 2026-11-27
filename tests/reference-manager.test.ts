@@ -73,6 +73,20 @@ test('moves a pasted official share link to a valid personal Markdown link', asy
 	assert.equal(markdown.slice(0, result.from) + result.markdown + markdown.slice(result.to), `See ${replacement} for details.`);
 });
 
+test('does not treat a share URL embedded in an unrelated URL as a replaceable reference', async () => {
+	const share = 'https://pan.quark.cn/s/share1234';
+	const markdown = `[External](https://example.com/?redirect=${share})\n${share}`;
+	const rows = await noteReferences(markdown);
+	assert.deepEqual(rows.map(({ line }) => line), [2]);
+});
+
+test('finds pasted shares followed immediately by Chinese punctuation', async () => {
+	const markdown = '资料链接：https://pan.quark.cn/s/share1234，打开后查看。';
+	const [row] = await noteReferences(markdown);
+	assert.ok(row);
+	assert.equal(markdown.slice(row.from, row.to), 'https://pan.quark.cn/s/share1234');
+});
+
 test('keeps failed checks unknown, and reuses the result for repeated references', async () => {
 	const rows = await noteReferences(`${original}\n${original}\n${replacement}`);
 	let checks = 0;

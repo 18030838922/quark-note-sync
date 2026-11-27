@@ -73,6 +73,21 @@ async function loadPlugin(data: object, savedCookie: string | null = 'sid=fixtur
 	const readyCallbacks: Array<() => void> = [];
 	const sideRequests: Array<{ type: string; side: string; reveal?: boolean }> = [];
 	type Sidebar = { actions: QuarkDashboardActions; view: QuarkDashboardView };
+	type Tab = {
+		type: string;
+		root: object;
+		getRoot(): object;
+		loaded: boolean;
+		setViewState(state: { type: string; active?: boolean }): Promise<void>;
+		loadIfDeferred(): Promise<void>;
+	};
+	const tabs: Tab[] = [];
+	let activeTab: Tab | undefined;
+	let focusedTab: Tab | undefined;
+	const makeDrawer = () => ({ collapsed: true, collapse() { this.collapsed = true; } });
+	const leftSplit = makeDrawer();
+	const rightSplit = makeDrawer();
+	const rootSplit = {};
 	let factory: ((leaf: object) => Sidebar) | undefined;
 	let sidebarLeaf: { view?: Sidebar } | undefined;
 	let revealed = 0;
@@ -86,16 +101,47 @@ async function loadPlugin(data: object, savedCookie: string | null = 'sid=fixtur
 	let quotaRequests = 0;
 	const app = {
 		workspace: {
+			leftSplit,
+			rightSplit,
+			rootSplit,
 			on: (name: string, callback: (...args: unknown[]) => void) => { workspaceEvents.set(name, callback); return { name, callback }; },
 			onLayoutReady: (callback: () => void) => readyCallbacks.push(callback),
 			getActiveViewOfType: () => null,
-			getLeavesOfType: () => sidebarLeaf ? [sidebarLeaf] : [],
+			getLeavesOfType(type: string) {
+				if (type === 'quark-note-sync-dashboard') return sidebarLeaf ? [sidebarLeaf] : [];
+				return tabs.filter((tab) => tab.type === type);
+			},
+			getLeaf(where: string) {
+				assert.equal(where, 'tab');
+				const tab: Tab = {
+					type: 'empty', root: rootSplit, loaded: false,
+					getRoot() { return this.root; },
+					async setViewState({ type, active }) {
+						this.type = type;
+						if (active) activeTab = this;
+					},
+					async loadIfDeferred() { this.loaded = true; },
+				};
+				tabs.push(tab);
+				return tab;
+			},
+			setActiveLeaf(leaf: Tab, options?: { focus?: boolean }) {
+				activeTab = leaf;
+				if (options?.focus && leaf.loaded && (platform === 'desktop' || (leftSplit.collapsed && rightSplit.collapsed))) {
+					focusedTab = leaf;
+				}
+			},
 			async ensureSideLeaf(type: string, side: string, options: { reveal?: boolean }) {
 				sideRequests.push({ type, side, reveal: options.reveal });
 				return sidebarLeaf ??= {};
 			},
-			async revealLeaf(leaf: { view?: Sidebar }) {
+			async revealLeaf(leaf: Tab | { view?: Sidebar }) {
+				if ('type' in leaf) {
+					await leaf.loadIfDeferred();
+					return;
+				}
 				revealed += 1;
+				leftSplit.collapsed = false;
 				leaf.view ??= factory?.(leaf);
 			},
 		},
@@ -191,6 +237,7 @@ async function loadPlugin(data: object, savedCookie: string | null = 'sid=fixtur
 		requestCount: () => requests,
 		quotaRequestCount: () => quotaRequests,
 		sideRequests, revealedCount: () => revealed, modalCount: () => modalOpens,
+		workspace: app.workspace, activeTab: () => activeTab, focusedTab: () => focusedTab,
 		readSidebar: () => sidebarLeaf?.view,
 		showSettings: () => settingsTab.display(),
 		settingsText: () => renderedText(settingsTab.containerEl),
@@ -318,6 +365,34 @@ test('the dashboard is registered on the left and reveals a single tab', async (
 	assert.equal(loggedOut.requestCount(), 0);
 });
 
+for (const platform of ['ios', 'android', 'desktop'] as const) {
+	test(`the dashboard focuses the Quark reference tab on ${platform}`, async () => {
+		const fixture = await loadPlugin({}, null, platform);
+		const note = fixture.workspace.getLeaf('tab');
+		await note.setViewState({ type: 'markdown', active: true });
+
+		await fixture.plugin.openDashboard();
+		const openReferences = fixture.readSidebar()?.actions.manageReferences;
+		assert.ok(openReferences);
+		await openReferences();
+		const tabs = fixture.workspace.getLeavesOfType('quark-note-sync-reference-manager');
+		assert.equal(tabs.length, 1);
+		assert.equal(fixture.workspace.leftSplit.collapsed, platform !== 'desktop');
+		assert.equal(fixture.activeTab(), tabs[0]);
+		assert.equal(fixture.focusedTab(), tabs[0]);
+
+		await note.loadIfDeferred();
+		fixture.workspace.setActiveLeaf(note, { focus: true });
+		assert.equal(fixture.focusedTab(), note);
+		await fixture.plugin.openDashboard();
+		await openReferences();
+		assert.deepEqual(fixture.workspace.getLeavesOfType('quark-note-sync-reference-manager'), tabs);
+		assert.equal(fixture.workspace.leftSplit.collapsed, platform !== 'desktop');
+		assert.equal(fixture.activeTab(), tabs[0]);
+		assert.equal(fixture.focusedTab(), tabs[0]);
+	});
+}
+
 test('first sync uses the sidebar preview and cannot run until confirmed there', async () => {
 	const fixture = await loadPlugin({});
 	let previewCalls = 0;
@@ -381,4 +456,22 @@ test('Quark Drive browse command and public editor menu are registered', async (
 		getSelection: () => '', getCursor: () => ({ line: 0, ch: 0 }), getLine: () => '',
 	}, {});
 	assert.ok(titles.some((title) => /夸克|Quark/.test(title)));
+});
+
+
+test('opening the mobile reference manager uses the main workspace even if an existing tab is docked in a sidebar', async () => {
+	const fixture = await loadPlugin({}, null, 'android');
+	const sidebarReference = fixture.workspace.getLeaf('tab');
+	sidebarReference.root = fixture.workspace.leftSplit;
+	await sidebarReference.setViewState({ type: 'quark-note-sync-reference-manager' });
+	fixture.workspace.leftSplit.collapsed = false;
+
+	await fixture.plugin.openDashboard();
+	const openReferences = fixture.readSidebar()?.actions.manageReferences;
+	assert.ok(openReferences);
+	await openReferences();
+	const references = fixture.workspace.getLeavesOfType('quark-note-sync-reference-manager');
+	assert.equal(references.length, 2);
+	assert.equal(fixture.focusedTab(), references[1]);
+	assert.equal(fixture.workspace.leftSplit.collapsed, true);
 });

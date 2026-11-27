@@ -1,4 +1,5 @@
 import { loadPdfJs } from 'obsidian';
+import { attachPreviewPinch } from './preview-pinch.ts';
 
 interface PdfViewport {
 	width: number;
@@ -29,6 +30,23 @@ interface PdfLibrary {
 	getDocument(options: { data: Uint8Array; isEvalSupported: false }): PdfLoadingTask;
 }
 
+interface PageSlot {
+	element: HTMLElement;
+	aspect: number;
+	failed?: boolean;
+}
+
+interface RenderedPage {
+	canvas: HTMLCanvasElement;
+	displayWidth: number;
+}
+
+interface PageRender {
+	index: number;
+	task?: ReturnType<PdfPage['render']>;
+	canvas?: HTMLCanvasElement;
+}
+
 export interface PdfReadingPosition {
 	page: number;
 	zoom: number;
@@ -36,14 +54,25 @@ export interface PdfReadingPosition {
 
 const FIT_WIDTH = 1;
 const MAX_ZOOM = 3;
-const ZOOM_STEP = 0.25;
+const MAX_RENDERED_PAGES = 6;
+const MAX_CANVAS_PIXELS = 2_000_000;
 
-function pdfCanvasScale(width: number, height: number, displayWidth: number, pixelRatio: number): number {
-	if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+function pdfPageAspect({ width, height }: PdfViewport): number {
+	const aspect = width / height;
+	if (!Number.isFinite(aspect) || width <= 0 || height <= 0 || aspect <= 0) {
 		throw new Error('Invalid PDF viewport');
 	}
+	return aspect;
+}
+
+function pdfCanvasScale({ width, height }: PdfViewport, displayWidth: number, pixelRatio: number): number {
 	const target = displayWidth * Math.min(Math.max(pixelRatio, 1), 2) / width;
-	return Math.min(target, 4096 / width, 4096 / height, Math.sqrt(4_000_000 / width / height));
+	return Math.min(target, 4096 / width, 4096 / height, Math.sqrt(MAX_CANVAS_PIXELS / width / height));
+}
+
+function releaseCanvas(canvas: HTMLCanvasElement): void {
+	canvas.remove();
+	canvas.width = canvas.height = 0;
 }
 
 export function mountMobilePdfPreview(
@@ -55,184 +84,280 @@ export function mountMobilePdfPreview(
 	onPositionChange?: (position: PdfReadingPosition) => void,
 ): () => void {
 	const label = (chinese: string, english: string) => language === 'en' ? english : chinese;
-	const toolbar = container.createDiv({ cls: 'quark-pdf-toolbar' });
-	const pages = toolbar.createEl('form', { cls: 'quark-pdf-controls' });
-	const previous = pages.createEl('button', {
-		text: '‹', attr: { type: 'button', 'aria-label': label('上一页', 'Previous page') },
-	});
-	const pageInput = pages.createEl('input', {
-		cls: 'quark-pdf-page-input',
-		attr: { type: 'text', inputmode: 'numeric', enterkeyhint: 'go', 'aria-label': label('页码', 'Page number') },
-	});
-	const pageTotal = pages.createSpan();
-	const jump = pages.createEl('button', { text: label('跳转', 'Go'), attr: { type: 'submit' } });
-	const next = pages.createEl('button', {
-		text: '›', attr: { type: 'button', 'aria-label': label('下一页', 'Next page') },
-	});
-	const zoomControls = toolbar.createDiv({ cls: 'quark-pdf-controls' });
-	const zoomOut = zoomControls.createEl('button', {
-		text: '−', attr: { type: 'button', 'aria-label': label('缩小', 'Zoom out') },
-	});
-	const fitWidthLabel = label('适合宽度', 'Fit width');
-	const fitWidth = zoomControls.createEl('button', {
-		text: fitWidthLabel, attr: { type: 'button', 'aria-label': fitWidthLabel },
-	});
-	const zoomIn = zoomControls.createEl('button', {
-		text: '+', attr: { type: 'button', 'aria-label': label('放大', 'Zoom in') },
-	});
-	const zoomValue = zoomControls.createSpan({ cls: 'quark-pdf-zoom-value' });
-	const status = toolbar.createSpan({ cls: 'quark-pdf-status', attr: { role: 'status' } });
-	const viewport = container.createDiv({ cls: 'quark-pdf-viewport' });
-	const canvas = viewport.createEl('canvas', { cls: 'quark-pdf-canvas', attr: { role: 'img' } });
-	canvas.hidden = true;
-	let closed = false;
-	let position: PdfReadingPosition | undefined;
-	let drawing = false;
-	let renderedWidth = 0;
+	const win = container.win;
+	const reader = container.createDiv({ cls: 'quark-pdf-reader' });
+	const count = reader.createSpan({ cls: 'quark-pdf-page-count', attr: { role: 'status' } });
+	count.hidden = true;
+	const status = reader.createEl('p', { cls: 'quark-pdf-status', attr: { role: 'status' } });
+	status.setText(label('正在加载 PDF…', 'Loading PDF…'));
+	const viewport = reader.createDiv({ cls: 'quark-pdf-viewport', attr: {
+		tabindex: '0', 'aria-label': label('PDF 阅读区', 'PDF reader'),
+	} });
+	const stack = viewport.createDiv({ cls: 'quark-pdf-pages' });
+	const slots: PageSlot[] = [];
+	const rendered = new Map<number, RenderedPage>();
+	let wanted: number[] = [];
+	let active: PageRender | undefined;
 	let loadingTask: PdfLoadingTask | undefined;
-	let renderTask: ReturnType<PdfPage['render']> | undefined;
 	let documentPdf: PdfDocument | undefined;
+	let frame: number | undefined;
+	let saveTimer: number | undefined;
+	let lastSaved = initialPosition;
+	let current = 0;
+	const initialZoom = initialPosition?.zoom ?? FIT_WIDTH;
+	let zoom = Number.isFinite(initialZoom) ? Math.min(MAX_ZOOM, Math.max(FIT_WIDTH, initialZoom)) : FIT_WIDTH;
+	let layoutWidth = 0;
+	let lastScrollTop = 0;
+	let pinching = false;
+	let painted = false;
+	let closed = false;
+	let failed = false;
+	container.addClass('quark-pdf-preview-active');
 
-	const updateControls = () => {
-		const page = position?.page ?? 0;
-		const zoom = position?.zoom ?? FIT_WIDTH;
-		const ready = !drawing && Boolean(position);
-		previous.disabled = !ready || page <= 1;
-		next.disabled = !ready || page >= (documentPdf?.numPages ?? 0);
-		pageInput.disabled = jump.disabled = !ready;
-		zoomOut.disabled = fitWidth.disabled = !ready || zoom <= FIT_WIDTH;
-		zoomIn.disabled = !ready || zoom >= MAX_ZOOM;
+	const pageWidth = () => Math.round(layoutWidth * zoom);
+	const savePosition = () => {
+		if (saveTimer !== undefined) win.clearTimeout(saveTimer);
+		saveTimer = undefined;
+		if (!painted) return;
+		const page = current + 1;
+		if (lastSaved?.page === page && lastSaved.zoom === zoom) return;
+		lastSaved = { page, zoom };
+		onPositionChange?.(lastSaved);
 	};
-	const loadingLabel = label('正在加载 PDF…', 'Loading PDF…');
-	const setStatus = (text: string, visible: boolean) => {
-		status.toggleClass('quark-pdf-status-visible', visible);
-		status.setText(text);
+	const scheduleSave = () => {
+		if (!painted || pinching) return;
+		if (lastSaved?.page === current + 1 && lastSaved.zoom === zoom) return;
+		if (saveTimer !== undefined) win.clearTimeout(saveTimer);
+		saveTimer = win.setTimeout(savePosition, 200);
+	};
+	const releaseRendered = () => {
+		for (const { canvas } of rendered.values()) releaseCanvas(canvas);
+		rendered.clear();
+	};
+	const stop = () => {
+		if (frame !== undefined) win.cancelAnimationFrame(frame);
+		frame = undefined;
+		resizeObserver.disconnect();
+		removePinch();
+		viewport.removeEventListener('scroll', schedule);
+		active?.task?.cancel();
+		if (active?.canvas) releaseCanvas(active.canvas);
+		releaseRendered();
+		if (loadingTask) void loadingTask.destroy().catch(() => {});
+		container.removeClass('quark-pdf-preview-active');
 	};
 	const fail = () => {
-		if (closed) return;
-		canvas.hidden = true;
-		canvas.width = canvas.height = 0;
-		setStatus(label('无法渲染 PDF。文件可能已加密、损坏或不受支持。', 'Could not render this PDF. The file may be encrypted, damaged, or unsupported.'), true);
-		if (!position) {
-			pages.remove();
-			zoomControls.remove();
-			showFallback();
-		}
+		if (closed || failed) return;
+		failed = true;
+		stop();
+		count.hidden = viewport.hidden = true;
+		status.hidden = false;
+		status.setText(label('无法渲染 PDF。文件可能已加密、损坏或不受支持。', 'Could not render this PDF. The file may be encrypted, damaged, or unsupported.'));
+		showFallback();
 	};
 
-	const renderPage = async (requested: PdfReadingPosition): Promise<void> => {
-		if (closed || drawing || !documentPdf) return;
-		drawing = true;
-		updateControls();
-		const samePage = position?.page === requested.page;
-		if (!samePage) setStatus(loadingLabel, !position);
-		const positionChanged = !samePage || position?.zoom !== requested.zoom;
-		const scrollTop = container.scrollTop;
-		const oldHeight = canvas.clientHeight;
-		const oldWidth = canvas.clientWidth;
-		const horizontalCenter = oldWidth ? (viewport.scrollLeft + viewport.clientWidth / 2) / oldWidth : 0.5;
+	const pageAt = (y: number) => {
+		let low = 0;
+		let high = slots.length;
+		while (low + 1 < high) {
+			const middle = (low + high) >>> 1;
+			if (slots[middle].element.offsetTop > y) high = middle;
+			else low = middle;
+		}
+		return low;
+	};
+	const captureAnchor = (y: number) => {
+		const element = slots[pageAt(y)].element;
+		const offset = y - element.offsetTop;
+		const height = Math.max(1, element.offsetHeight);
+		return { element, fraction: Math.min(offset / height, 1), gap: Math.max(0, offset - height) };
+	};
+	const restoreAnchor = (anchor: ReturnType<typeof captureAnchor>, y: number) => {
+		viewport.scrollTop = anchor.element.offsetTop + anchor.element.offsetHeight * anchor.fraction + anchor.gap - y;
+		lastScrollTop = viewport.scrollTop;
+	};
+	const updateAspect = (slot: PageSlot, aspect: number) => {
+		updateCurrent();
+		const anchor = captureAnchor(viewport.scrollTop);
+		slot.aspect = aspect;
+		slot.element.setCssProps({ 'aspect-ratio': String(aspect) });
+		restoreAnchor(anchor, 0);
+	};
+	const updateCurrent = () => {
+		if (viewport.scrollTop === lastScrollTop) return;
+		lastScrollTop = viewport.scrollTop;
+		const maxTop = viewport.scrollHeight - viewport.clientHeight;
+		current = maxTop > 1 && lastScrollTop >= maxTop - 1
+			? slots.length - 1
+			: pageAt(lastScrollTop + Math.min(64, viewport.clientHeight / 8));
+	};
+	const showPageCount = () => {
+		const page = current + 1;
+		const total = slots.length;
+		const text = label('第 ' + page + ' / ' + total + ' 页', page + ' / ' + total);
+		if (count.textContent === text) return;
+		count.setText(text);
+		count.setAttr('aria-label', label('第 ' + page + ' 页，共 ' + total + ' 页', 'Page ' + page + ' of ' + total));
+	};
+
+	const renderPage = async (index: number, pdf: PdfDocument) => {
+		const job: PageRender = { index };
+		active = job;
+		const slot = slots[index];
 		let page: PdfPage | undefined;
-		let succeeded = false;
+		let committed = false;
 		try {
-			page = await documentPdf.getPage(requested.page);
-			if (closed) return;
+			page = await pdf.getPage(index + 1);
+			if (closed || failed || !wanted.includes(index)) return;
 			const base = page.getViewport({ scale: 1 });
-			renderedWidth = viewport.clientWidth;
-			const displayWidth = (renderedWidth || 600) * requested.zoom;
-			const scale = pdfCanvasScale(base.width, base.height, displayWidth, container.win.devicePixelRatio);
+			const aspect = pdfPageAspect(base);
+			if (slot.aspect !== aspect) updateAspect(slot, aspect);
+			const displayWidth = pageWidth();
+			const scale = pdfCanvasScale(base, displayWidth, win.devicePixelRatio);
 			const pageViewport = page.getViewport({ scale });
+			const canvas = container.doc.adoptNode(createEl('canvas', { cls: 'quark-pdf-canvas' }));
 			canvas.width = Math.max(1, Math.floor(pageViewport.width));
 			canvas.height = Math.max(1, Math.floor(pageViewport.height));
+			job.canvas = canvas;
 			const context = canvas.getContext('2d', { alpha: false });
 			if (!context) throw new Error('PDF canvas is unavailable');
-			renderTask = page.render({ canvas, canvasContext: context, viewport: pageViewport });
-			await renderTask.promise;
-			if (closed) return;
-			position = requested;
-			canvas.style.width = `${requested.zoom * 100}%`;
-			canvas.hidden = false;
-			const pageLabel = label(`第 ${requested.page} / ${documentPdf.numPages} 页`, `Page ${requested.page} of ${documentPdf.numPages}`);
-			canvas.setAttr('aria-label', pageLabel);
-			pageInput.value = String(requested.page);
-			zoomValue.setText(`${Math.round(requested.zoom * 100)}%`);
-			setStatus(pageLabel, false);
-			container.scrollTop = samePage && oldHeight ? scrollTop * canvas.clientHeight / oldHeight : 0;
-			viewport.scrollLeft = samePage ? horizontalCenter * canvas.clientWidth - viewport.clientWidth / 2 : 0;
-			succeeded = true;
-		} catch {
-			fail();
-		} finally {
-			renderTask = undefined;
-			drawing = false;
-			if (!closed) {
-				page?.cleanup();
-				updateControls();
+			job.task = page.render({ canvas, canvasContext: context, viewport: pageViewport });
+			await job.task.promise;
+			if (closed || failed || !wanted.includes(index)) return;
+			const previous = rendered.get(index);
+			if (previous) releaseCanvas(previous.canvas);
+			slot.element.appendChild(canvas);
+			rendered.set(index, { canvas, displayWidth });
+			committed = true;
+			painted = true;
+			status.hidden = true;
+			scheduleSave();
+		} catch (error) {
+			if (closed || failed || (error as Error | undefined)?.name === 'RenderingCancelledException') return;
+			if (!painted && index === current) {
+				fail();
+			} else {
+				slot.failed = true;
+				if (!rendered.has(index)) slot.element.setText(label('此页无法显示', 'This page could not be rendered'));
 			}
-		}
-		if (succeeded && !closed) {
-			if (positionChanged) onPositionChange?.(requested);
-			refreshSize();
+		} finally {
+			if (!committed && job.canvas) releaseCanvas(job.canvas);
+			if (!closed && !failed) page?.cleanup();
+			active = undefined;
+			schedule();
 		}
 	};
 
-	const refreshSize = () => {
-		const width = viewport.clientWidth;
-		if (position && !canvas.hidden && width > 0 && width !== renderedWidth) void renderPage(position);
-	};
-	const resizeObserver = new ResizeObserver(refreshSize);
-	resizeObserver.observe(viewport);
-	const goToPage = (pageNumber: number) => {
-		if (!position || !documentPdf || drawing) return;
-		if (!Number.isInteger(pageNumber) || pageNumber < 1 || pageNumber > documentPdf.numPages) {
-			setStatus(label(`请输入 1 至 ${documentPdf.numPages} 的页码。`, `Enter a page from 1 to ${documentPdf.numPages}.`), true);
+	function refresh(): void {
+		frame = undefined;
+		if (closed || failed || !slots.length || !layoutWidth || !viewport.clientHeight || !documentPdf) return;
+		updateCurrent();
+		showPageCount();
+		scheduleSave();
+		const start = pageAt(viewport.scrollTop);
+		const end = pageAt(viewport.scrollTop + viewport.clientHeight);
+		const nearby = [current];
+		for (let index = start; index <= end && nearby.length < MAX_RENDERED_PAGES; index++) {
+			if (index !== current) nearby.push(index);
+		}
+		if (end + 1 < slots.length && nearby.length < MAX_RENDERED_PAGES) nearby.push(end + 1);
+		if (start > 0 && nearby.length < MAX_RENDERED_PAGES) nearby.push(start - 1);
+		wanted = nearby;
+		for (const [index, entry] of rendered) {
+			if (wanted.includes(index)) continue;
+			releaseCanvas(entry.canvas);
+			rendered.delete(index);
+		}
+		if (active) {
+			if (!wanted.includes(active.index)) active.task?.cancel();
 			return;
 		}
-		void renderPage({ ...position, page: pageNumber });
+		if (pinching) return;
+		const displayWidth = pageWidth();
+		const index = wanted.find((page) => !slots[page].failed && rendered.get(page)?.displayWidth !== displayWidth);
+		if (index !== undefined) void renderPage(index, documentPdf);
+	}
+	function schedule(): void {
+		if (closed || failed || frame !== undefined) return;
+		frame = win.requestAnimationFrame(refresh);
+	}
+	const resize = () => {
+		const width = viewport.clientWidth;
+		if (!slots.length || !width || !viewport.clientHeight) return;
+		if (!layoutWidth) {
+			layoutWidth = width;
+			stack.setCssProps({ width: pageWidth() + 'px' });
+			viewport.scrollTop = slots[current].element.offsetTop;
+			lastScrollTop = viewport.scrollTop;
+		} else if (width !== layoutWidth) {
+			updateCurrent();
+			const anchor = captureAnchor(viewport.scrollTop);
+			const relativeLeft = viewport.scrollLeft / layoutWidth;
+			layoutWidth = width;
+			stack.setCssProps({ width: pageWidth() + 'px' });
+			viewport.scrollLeft = relativeLeft * layoutWidth;
+			restoreAnchor(anchor, 0);
+		}
+		schedule();
 	};
-	previous.addEventListener('click', () => { if (position) goToPage(position.page - 1); });
-	next.addEventListener('click', () => { if (position) goToPage(position.page + 1); });
-	pages.addEventListener('submit', (event) => {
-		event.preventDefault();
-		const input = pageInput.value.trim();
-		goToPage(/^\d+$/.test(input) ? Number(input) : NaN);
-		pageInput.blur();
+	const resizeObserver = new ResizeObserver(resize);
+	resizeObserver.observe(viewport);
+	viewport.addEventListener('scroll', schedule, { passive: true });
+
+	const removePinch = attachPreviewPinch(viewport, () => zoom, (scale, center, previousCenter) => {
+		if (!slots.length || !layoutWidth) return;
+		pinching = true;
+		if (saveTimer !== undefined) win.clearTimeout(saveTimer);
+		saveTimer = undefined;
+		updateCurrent();
+		const anchor = captureAnchor(viewport.scrollTop + previousCenter.y);
+		const relativeX = (viewport.scrollLeft + previousCenter.x) / zoom;
+		zoom = scale;
+		stack.setCssProps({ width: pageWidth() + 'px' });
+		viewport.scrollLeft = relativeX * zoom - center.x;
+		restoreAnchor(anchor, center.y);
+		schedule();
+	}, () => {
+		pinching = false;
+		schedule();
 	});
-	zoomIn.addEventListener('click', () => {
-		if (position) void renderPage({ ...position, zoom: Math.min(MAX_ZOOM, position.zoom + ZOOM_STEP) });
-	});
-	zoomOut.addEventListener('click', () => {
-		if (position) void renderPage({ ...position, zoom: Math.max(FIT_WIDTH, position.zoom - ZOOM_STEP) });
-	});
-	fitWidth.addEventListener('click', () => {
-		if (position) void renderPage({ ...position, zoom: FIT_WIDTH });
-	});
-	updateControls();
-	setStatus(loadingLabel, true);
+
 	void (async () => {
 		try {
 			const pdf = await loadPdfJs() as PdfLibrary;
 			if (closed) return;
-			// PDF.js may transfer the input buffer to its worker. Preserve the preview's original bytes.
+			// PDF.js may transfer the input buffer to its worker.
 			loadingTask = pdf.getDocument({ data: bytes.slice(), isEvalSupported: false });
 			documentPdf = await loadingTask.promise;
 			if (closed) return;
-			pageTotal.setText(`/ ${documentPdf.numPages}`);
-			const page = initialPosition?.page ?? 1;
-			const zoom = initialPosition?.zoom ?? FIT_WIDTH;
-			await renderPage({
-				page: Number.isSafeInteger(page) ? Math.min(documentPdf.numPages, Math.max(1, page)) : 1,
-				zoom: Number.isFinite(zoom) ? Math.min(MAX_ZOOM, Math.max(FIT_WIDTH, zoom)) : FIT_WIDTH,
-			});
+			const requested = initialPosition?.page ?? 1;
+			current = Number.isSafeInteger(requested) ? Math.min(documentPdf.numPages, Math.max(1, requested)) - 1 : 0;
+			const firstPage = await documentPdf.getPage(current + 1);
+			if (closed) return;
+			const aspect = pdfPageAspect(firstPage.getViewport({ scale: 1 }));
+			firstPage.cleanup();
+			const fragment = container.doc.adoptNode(createFragment());
+			for (let index = 0; index < documentPdf.numPages; index++) {
+				const element = fragment.createDiv({ cls: 'quark-pdf-page', attr: {
+					role: 'img', 'aria-label': label('第 ' + (index + 1) + ' 页', 'Page ' + (index + 1)),
+				} });
+				element.setCssProps({ 'aspect-ratio': String(aspect) });
+				slots.push({ element, aspect });
+			}
+			stack.appendChild(fragment);
+			count.hidden = false;
+			showPageCount();
+			resize();
 		} catch {
 			fail();
 		}
 	})();
 
 	return () => {
+		if (closed) return;
+		if (painted && !failed) updateCurrent();
+		savePosition();
 		closed = true;
-		resizeObserver.disconnect();
-		renderTask?.cancel();
-		if (loadingTask) void loadingTask.destroy().catch(() => {});
-		canvas.width = canvas.height = 0;
+		if (!failed) stop();
 	};
 }

@@ -36,7 +36,7 @@ Open **Resolve conflicts** to compare local content with the active cloud versio
 
 Right-click in a note and select **Insert Quark Drive file**. You can also run it from the command palette on desktop or mobile. Browse your drive, then choose **Insert link only** or **Download to vault and insert**. Both actions write the same Markdown link. The private link opens on another device after you sign in with the same Quark account.
 
-In Reading View and Live Preview, personal images and audio load when their links come into view. For images, the plugin first tries Quark’s image preview, which can work when downloading the original fails. PDF and plain-text links open in a main workspace tab. On mobile, the PDF preview supports page jumps, zoom, and fit-to-width. Reopening a PDF restores its reading position on the same device.
+In Reading View and Live Preview, personal images and audio load when their links come into view. For images, the plugin first tries Quark’s image preview, which can work when downloading the original fails. PDF and plain-text links open in a main workspace tab. On mobile, scroll through PDF pages continuously and pinch to zoom. Pinch zoom also works in the image, text, audio, and video preview tabs. Reopening a PDF restores its reading position on the same device.
 
 For personal videos and supported public shares, select **Play from Quark** to stream the video in Obsidian. Streaming can play videos larger than 50 MiB and lets you seek while the player loads segments. Windows playback has been verified. Android and iOS/iPadOS playback still needs device testing. If the player or stream is unavailable, you can open Quark to watch.
 
@@ -46,7 +46,7 @@ Paste an official `pan.quark.cn` share URL to browse shared folders, enter a pas
 
 In the personal Drive browser, search by filename under the current folder or across the drive. Searches read folder pages in batches. You can continue if the first batch does not cover the whole scope. Favorite folders and recent folders are saved on this device for the current Quark account.
 
-Open **Quark references** from the dashboard to see which notes link to Quark and which references have local copies. Check links on demand and choose a replacement file for a selected reference. An unavailable account, missing passcode, or request failure can leave a link unverified.
+Open **Quark references** from the dashboard to switch to the references tab and see linked notes and local copies. Check links on demand and choose a replacement file for a selected reference. An unavailable account, missing passcode, or request failure can leave a link unverified.
 
 ## Install
 

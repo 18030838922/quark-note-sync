@@ -364,12 +364,24 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 		}
 	}
 
+	private async focusQuarkTab(leaf: WorkspaceLeaf): Promise<void> {
+		const workspace = this.app.workspace;
+		await workspace.revealLeaf(leaf);
+		if (this.unloading) return;
+		if (Platform.isMobileApp && leaf.getRoot() === workspace.rootSplit) {
+			if (!workspace.leftSplit.collapsed) workspace.leftSplit.collapse();
+			if (!workspace.rightSplit.collapsed) workspace.rightSplit.collapse();
+		}
+		workspace.setActiveLeaf(leaf, { focus: true });
+	}
+
 	private async openBrowser(target?: SourceEditorTarget, mode: 'personal' | 'share' = 'personal'): Promise<QuarkBrowserView | undefined> {
 		if (this.unloading) return undefined;
 		try {
 			const leaf = this.app.workspace.getLeaf('tab');
-			await leaf.setViewState({ type: QUARK_BROWSER_VIEW_TYPE, state: { mode }, active: true });
-			await leaf.loadIfDeferred();
+			await leaf.setViewState({ type: QUARK_BROWSER_VIEW_TYPE, state: { mode } });
+			await this.focusQuarkTab(leaf);
+			if (this.unloading) return undefined;
 			const view = leaf.view as QuarkBrowserView;
 			view.setInsertionTarget(target);
 			return view;
@@ -682,8 +694,9 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 	private async openPreviewTab(payload: PreviewPayload): Promise<void> {
 		if (this.unloading) return;
 		const leaf = this.app.workspace.getLeaf('tab');
-		await leaf.setViewState({ type: QUARK_PREVIEW_VIEW_TYPE, active: true });
-		await leaf.loadIfDeferred();
+		await leaf.setViewState({ type: QUARK_PREVIEW_VIEW_TYPE });
+		await this.focusQuarkTab(leaf);
+		if (this.unloading) return;
 		const view = leaf.view as QuarkPreviewView;
 		view.show(payload);
 	}
@@ -1510,10 +1523,12 @@ export default class QuarkNoteSyncPlugin extends Plugin {
 
 	private async openReferenceManager(): Promise<void> {
 		await this.runExclusive('打开网盘引用', async () => {
-			const existing = this.app.workspace.getLeavesOfType(QUARK_REFERENCE_MANAGER_VIEW_TYPE)[0];
-			const leaf = existing ?? this.app.workspace.getLeaf('tab');
-			if (!existing) await leaf.setViewState({ type: QUARK_REFERENCE_MANAGER_VIEW_TYPE, active: true });
-			await this.app.workspace.revealLeaf(leaf);
+			const workspace = this.app.workspace;
+			const existing = workspace.getLeavesOfType(QUARK_REFERENCE_MANAGER_VIEW_TYPE)
+				.find((leaf) => !Platform.isMobileApp || leaf.getRoot() === workspace.rootSplit);
+			const leaf = existing ?? workspace.getLeaf('tab');
+			if (!existing) await leaf.setViewState({ type: QUARK_REFERENCE_MANAGER_VIEW_TYPE });
+			await this.focusQuarkTab(leaf);
 		});
 	}
 
