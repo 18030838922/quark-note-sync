@@ -349,7 +349,7 @@ export class QuarkSyncService {
 		}
 		await this.downloadBlob(layout, winner);
 		// Persist the local-only removal intent before touching the vault. A retry cannot publish a tombstone.
-		await this.setAttachment(path, { size: winner.size!, sha256: winner.sha256!, headId: winner.id, deferred: true, pinned: false });
+		await this.setAttachment(path, { size: winner.size!, sha256: winner.sha256, headId: winner.id, deferred: true, pinned: false });
 		try {
 			await this.local.trash(path, this.app.vault.configDir, plan.expectedLocalHash);
 		} catch (error) {

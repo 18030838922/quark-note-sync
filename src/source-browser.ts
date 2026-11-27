@@ -814,7 +814,7 @@ export class QuarkPreviewView extends ItemView {
 	private previewMediaContainer(): HTMLElement {
 		if (!Platform.isMobileApp) return this.contentEl;
 		const surface = createMobileMediaSurface(this.contentEl);
-		this.stopPinch = surface.dispose;
+		this.stopPinch = () => surface.dispose();
 		return surface.content;
 	}
 

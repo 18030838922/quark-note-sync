@@ -180,7 +180,7 @@ export function mountMobilePdfPreview(
 		updateCurrent();
 		const anchor = captureAnchor(viewport.scrollTop);
 		slot.aspect = aspect;
-		slot.element.setCssProps({ 'aspect-ratio': String(aspect) });
+		slot.element.setCssProps({ '--quark-pdf-page-aspect': String(aspect) });
 		restoreAnchor(anchor, 0);
 	};
 	const updateCurrent = () => {
@@ -341,7 +341,7 @@ export function mountMobilePdfPreview(
 				const element = fragment.createDiv({ cls: 'quark-pdf-page', attr: {
 					role: 'img', 'aria-label': label('第 ' + (index + 1) + ' 页', 'Page ' + (index + 1)),
 				} });
-				element.setCssProps({ 'aspect-ratio': String(aspect) });
+				element.setCssProps({ '--quark-pdf-page-aspect': String(aspect) });
 				slots.push({ element, aspect });
 			}
 			stack.appendChild(fragment);

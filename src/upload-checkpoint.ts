@@ -18,7 +18,7 @@ export interface UploadCheckpoint {
 
 /** Store upload authorization in device-local secret storage. The key is an opaque fingerprint. */
 export interface UploadCheckpointStore {
-	get(key: string): unknown | Promise<unknown>;
+	get(key: string): unknown;
 	set(key: string, value: UploadCheckpoint | null): void | Promise<void>;
 }
 

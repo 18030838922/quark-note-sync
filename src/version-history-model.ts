@@ -88,7 +88,12 @@ export function decodeVersionText(path: string, bytes: Uint8Array): string | nul
 	if (!canPreviewVersionText(path, bytes.byteLength)) return null;
 	try {
 		const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
-		return /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(text) ? null : text;
+		for (let index = 0; index < text.length; index++) {
+			const code = text.charCodeAt(index);
+			// Keep tabs, line feeds, and carriage returns in text previews.
+			if (code < 9 || code === 11 || code === 12 || (code > 13 && code < 32) || code === 127) return null;
+		}
+		return text;
 	} catch {
 		return null;
 	}

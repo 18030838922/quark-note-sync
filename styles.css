@@ -1021,6 +1021,7 @@
 }
 
 .quark-pdf-page {
+	aspect-ratio: var(--quark-pdf-page-aspect);
 	background: var(--background-secondary);
 	min-width: 0;
 	overflow: hidden;
